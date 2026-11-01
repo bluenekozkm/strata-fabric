@@ -96,6 +96,18 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
+**Searched-scale 4-bit KV cache (0.1.48, optional):** `--kv q4s` is q4_0's rotation and q4_0's exact footprint
+(576 B per cell, 6.9 KB per token over the 12 QSA layers), but sixteen values per block instead of 32 and a scale
+searched per block instead of taken from the maximum: three candidates around the group's maximum, each rounded
+to an e4m3 byte, the smallest squared error wins. The full-range candidates represent both extremes exactly,
+which is where q4_0's precision went (its signed scale always clips one extreme a full step). Teacher-forced on
+the frozen quality set, q4s beats q4_0 on top-1 agreement (93.77% vs 93.29%), KL (0.0398 vs 0.0419) and
+perplexity (4.117 vs 4.142, fp16's 4.118), with q4_0's memory and expert slots (0.84 GiB of K/V in RAM at 131K
+against int8's 1.55 GiB, 5,199 vs 5,173 expert slots). Needles 8/8 to a 249K-token prompt; the 105K-token
+request decodes 28.3 tokens/s against q4_0's 26.4 and int8's 27.2, prompts like q4_0's (~11% slower than int8).
+It combines with `--kv-resident`, the tiered KV and MTP; its format id is its own, so cached blocks never mix.
+First grid measured worse; the shipped one came from a host RMSE study.
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt

@@ -526,6 +526,12 @@ an RX 9070 XT 16 GB and a Radeon AI PRO R9700 32 GB (both gfx1201), a Ryzen 9 39
     (`--pcie-frac 0 --adapt-every 0`, `STRATA_PREFILL_CPU_SHARE=0`, `STRATA_ROUTE_TAIL_SKIP=0`): 20K prompt x1.46 (`=1`) /
     x1.54 (`auto`), 4K x1.33 / x1.34 (6/6 pairs; the noise arm of that run read +6.4-6.9%, so read them as +40-50% and
     +30%); the 8-token answers were the default's in every run.
+  - The 4-bit KV formats work on HIP: decode attention runs the fused kernel for both, and prompts take the
+    portable gather path (the CUDA tensor-core prompt kernel for 4-bit K/V is compiled out under HIP, the same
+    as for q4_0 since PR #21). `--kv q4s` (the searched-scale format, q4_0's bytes with less precision loss) is
+    measured on this machine's gfx1201 (Radeon 16 GiB, i5-12400F): teacher-forced quality ahead of `--kv q4_0`,
+    needles 8/8 to a 249K-token prompt with `--kv-resident 32768`, and the 105K-token request decoded 28.3 tok/s
+    against int8's 27.2 (the quality numbers were measured on this box, not the RTX ones above).
   - The first prompt after a start pays two one-time hipBLAS library loads (the first BF16 product 1.2 s, the first FP16
     product 1.0 s on an R9700 with the gfx120X wheel's hipBLASLt 1.2.0; `STRATA_COLD_TRACE=1` times the first 80 dense
     projections to show them). The engine now runs one tiny BF16 and one tiny FP16 product on a thread of its own while the

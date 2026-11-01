@@ -19,6 +19,7 @@ using strata::kernels::kKvF16;
 using strata::kernels::kKvInt8;
 using strata::kernels::kKvQ4;
 using strata::kernels::kKvHybrid;
+using strata::kernels::kKvQ4S;
 
 inline constexpr size_t kKvBlockAlignment = 4096;
 inline constexpr uint32_t kKvBlockTokens = 128;

@@ -405,6 +405,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
+                          src/kernels/cuda/kv_q4s.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
@@ -1298,6 +1299,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q4_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+  # q4s: the searched-scale 4-bit KV (kv_q4s.hpp) - e4m3 codec, the scale search, and append/gather bitwise vs
+  # q4s_quantize_group_host (GPU, synthetic, no model).
+  add_executable(kv_q4s_parity src/kernels/kv_q4s_parity.cpp)
+  target_include_directories(kv_q4s_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(kv_q4s_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME kv_q4s_parity COMMAND kv_q4s_parity)
   # the verify window's one-launch forms (hyper-connection write, PLE post-ops with the commit's
   # history snapshots) vs the per-token launches they replace, bitwise (GPU, synthetic, no model)
   add_executable(verify_batch_parity src/kernels/verify_batch_parity.cpp)
