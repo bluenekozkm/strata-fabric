@@ -2396,6 +2396,7 @@ int main(int argc, char** argv) {
     bool have_tokens = false;
     bool have_logits_stride = false;
     bool conversation_cache_mib_set = false;
+    bool conversation_cache_slots_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -2678,7 +2679,10 @@ int main(int argc, char** argv) {
             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
-            else o.conversation_cache_slots = (int) number;
+            else {
+                o.conversation_cache_slots = (int) number;
+                conversation_cache_slots_set = true;
+            }
         }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
@@ -2965,9 +2969,9 @@ int main(int argc, char** argv) {
             }
         }
     }
-    if (o.exp_tiered_kv && !conversation_cache_mib_set) {
-        o.conversation_cache_mib = 4096;
-        if (o.conversation_cache_slots <= 0) o.conversation_cache_slots = 8;
+    if (o.exp_tiered_kv) {
+        if (!conversation_cache_mib_set) o.conversation_cache_mib = 4096;
+        if (!conversation_cache_slots_set) o.conversation_cache_slots = 8;
     }
     if (o.serve && o.conversation_cache_mib > 0 && (o.prompt_cache == 0 || o.conversation_cache_slots == 0))
         std::fprintf(stderr, "strata serve: warning: conversation caching is disabled by %s\n",
@@ -8339,6 +8343,7 @@ int main(int argc, char** argv) {
         std::shared_ptr<strata::platform::NvmeCache> nvme_cache;
         std::shared_ptr<strata::core::RadixConvCache> radix_cache;
         std::shared_ptr<strata::core::ContextSwitcher> context_switcher;
+        strata::core::RadixConvCacheConfig radix_cfg;
 
         if (o.exp_tiered_kv) {
             std::fprintf(stderr, "[strata] EXPERIMENTAL: Tiered KV Cache is ENABLED (--exp-tiered-kv)\n");
@@ -8357,10 +8362,11 @@ int main(int argc, char** argv) {
                                      "cached KV states are volatile and will be lost on engine exit or restart!\n");
             }
 
-            strata::core::RadixConvCacheConfig radix_cfg;
-            radix_cfg.host_ram_budget_bytes = (o.conversation_cache_mib > 0)
-                ? (static_cast<size_t>(o.conversation_cache_mib) * 1024ULL * 1024ULL)
-                : (2ULL * 1024 * 1024 * 1024);
+            radix_cfg.host_ram_budget_bytes = conversation_cache_mib_set
+                ? (static_cast<size_t>(std::max<int64_t>(0, o.conversation_cache_mib)) * 1024ULL * 1024ULL)
+                : (o.conversation_cache_mib > 0
+                    ? static_cast<size_t>(o.conversation_cache_mib) * 1024ULL * 1024ULL
+                    : (2ULL * 1024 * 1024 * 1024));
             radix_cfg.format = (o.kv == "int8") ? strata::core::kKvInt8
                              : (o.kv == "k8v4") ? strata::core::kKvHybrid
                              : (o.kv == "q4_0") ? strata::core::kKvQ4
@@ -8380,6 +8386,99 @@ int main(int argc, char** argv) {
             context_switcher = std::make_shared<strata::core::ContextSwitcher>(radix_cache, nvme_cache, cs_cfg);
             std::fprintf(stderr, "strata serve: initialized RadixConvCache and ContextSwitcher (fast prefill bypass enabled)\n");
         }
+
+        auto persist_tiered_kv = [&](const strata::core::SavedConversation& img) {
+            if (!o.exp_tiered_kv || img.live.ids.empty() || (!radix_cache && !nvme_cache)) return;
+            const bool is_pinned = img.pinned();
+            const size_t total_tokens = img.live.ids.size();
+            uint64_t prev_hash = 0;
+
+            for (size_t offset = 0; offset < total_tokens; offset += strata::core::kKvBlockTokens) {
+                const size_t count = std::min<size_t>(strata::core::kKvBlockTokens, total_tokens - offset);
+                strata::core::KvBlock block;
+                block.header.format = radix_cfg.format;
+                block.header.num_layers = radix_cfg.num_layers;
+                block.header.num_heads = radix_cfg.num_heads;
+                block.header.head_dim = radix_cfg.head_dim;
+                block.header.block_tokens = strata::core::kKvBlockTokens;
+                block.header.token_count = static_cast<uint32_t>(count);
+                block.header.parent_hash = prev_hash;
+                block.payload.token_ids.assign(img.live.ids.begin() + offset, img.live.ids.begin() + offset + count);
+
+                if (offset + count == total_tokens) {
+                    strata::core::RecurrenceState rec;
+                    rec.gdn = img.live.gdn;
+                    rec.ple = img.live.ple;
+                    rec.tails = img.live.tails;
+                    rec.dead = img.live.dead;
+                    rec.block_pos = img.live.block_pos;
+                    block.payload.recurrence = rec.serialize();
+                }
+
+                auto extract_kv = [&](const strata::core::ConversationKv& lkv) {
+                    if (lkv.cells <= 0) return;
+                    const size_t cell_k = lkv.k.size() / static_cast<size_t>(lkv.cells);
+                    const size_t cell_v = lkv.v.size() / static_cast<size_t>(lkv.cells);
+                    const size_t cell_ks = lkv.k_scale.size() / static_cast<size_t>(lkv.cells);
+                    const size_t cell_vs = lkv.v_scale.size() / static_cast<size_t>(lkv.cells);
+
+                    const size_t k_off = offset * cell_k, k_len = count * cell_k;
+                    const size_t v_off = offset * cell_v, v_len = count * cell_v;
+                    const size_t ks_off = offset * cell_ks, ks_len = count * cell_ks;
+                    const size_t vs_off = offset * cell_vs, vs_len = count * cell_vs;
+
+                    if (k_off < lkv.k.size()) {
+                        const size_t actual = std::min(k_len, lkv.k.size() - k_off);
+                        const size_t p = block.payload.k_data.size();
+                        block.payload.k_data.resize(p + actual);
+                        lkv.k.read(block.payload.k_data.data() + p, k_off, actual);
+                    }
+                    if (v_off < lkv.v.size()) {
+                        const size_t actual = std::min(v_len, lkv.v.size() - v_off);
+                        const size_t p = block.payload.v_data.size();
+                        block.payload.v_data.resize(p + actual);
+                        lkv.v.read(block.payload.v_data.data() + p, v_off, actual);
+                    }
+                    if (cell_ks > 0 && ks_off < lkv.k_scale.size()) {
+                        const size_t actual = std::min(ks_len, lkv.k_scale.size() - ks_off);
+                        const size_t p = block.payload.k_scale.size();
+                        block.payload.k_scale.resize(p + actual);
+                        lkv.k_scale.read(block.payload.k_scale.data() + p, ks_off, actual);
+                    }
+                    if (cell_vs > 0 && vs_off < lkv.v_scale.size()) {
+                        const size_t actual = std::min(vs_len, lkv.v_scale.size() - vs_off);
+                        const size_t p = block.payload.v_scale.size();
+                        block.payload.v_scale.resize(p + actual);
+                        lkv.v_scale.read(block.payload.v_scale.data() + p, vs_off, actual);
+                    }
+                };
+
+                for (const auto& lkv : img.kv) {
+                    extract_kv(lkv);
+                }
+                for (const auto& stg : img.stage_images) {
+                    for (const auto& lkv : stg.kv) {
+                        extract_kv(lkv);
+                    }
+                }
+
+                block.header.block_hash = strata::core::kv_block_hash(block);
+                prev_hash = block.header.block_hash;
+
+                auto block_ptr = std::make_shared<strata::core::KvBlock>(std::move(block));
+                if (radix_cache) {
+                    auto node = radix_cache->insert_sequence(
+                        img.live.ids.data(), offset + count,
+                        is_pinned, is_pinned);
+                    if (node && o.conversation_cache_mib > 0) {
+                        radix_cache->set_kv_block(node->node_id, block_ptr);
+                    }
+                }
+                if (nvme_cache) {
+                    nvme_cache->write_block_async(*block_ptr, is_pinned);
+                }
+            }
+        };
 
         strata::prefill::Prefill sp;
         // 149-prefetch STRATA_RAM_ADAPT2=1 (with STRATA_RAM_ADAPT=n, the promotions staged per window): see the window loop
@@ -9441,7 +9540,8 @@ int main(int argc, char** argv) {
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            const bool tiered_kv_active = o.exp_tiered_kv && (nvme_cache != nullptr || radix_cache != nullptr);
+            if ((!conversations.enabled() && !tiered_kv_active) || !live_ok || live.empty()) return true;
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -9530,7 +9630,7 @@ int main(int argc, char** argv) {
             // estimate must stay uncapped: it counts the retained buffers'
             // capacity and directories, and put() charges that same true size -
             // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
+            if (conversations.enabled() && !conversations.make_room(estimate, held)) {
                 std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                              estimate >> 20);
                 return true;
@@ -9592,8 +9692,9 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
                     return true;
                 }
+                persist_tiered_kv(image);
                 const size_t snapshot_bytes = image.bytes();
-                const bool stored = conversations.put(std::move(image), held);
+                const bool stored = conversations.enabled() ? conversations.put(std::move(image), held) : false;
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -15776,6 +15877,9 @@ int main(int argc, char** argv) {
                 helper_blobs_before = blobs;
                 helper_bytes_before = bytes;
             }
+        }
+        if (live_ok && !live.empty()) {
+            park_current(0);
         }
         save_profile("exit");   // #477: QUIT, or the server closed stdin
         flush_tiered_kv_manifest();
