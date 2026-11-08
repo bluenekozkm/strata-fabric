@@ -162,7 +162,11 @@ std::shared_ptr<RadixKvNode> RadixConvCache::insert_sequence(
             new_node->is_system_prompt.store(is_system_prompt, std::memory_order_relaxed);
             new_node->is_pinned.store(is_pinned, std::memory_order_relaxed);
             new_node->last_accessed_us.store(now, std::memory_order_relaxed);
+            if (config_.host_ram_budget_bytes > 0) {
+                if (config_.host_ram_budget_bytes > 0) {
             new_node->kv_block = std::move(block);
+        }
+            }
             new_node->ram_bytes = new_node->compute_ram_bytes();
 
             total_ram_bytes_ -= current->ram_bytes;
@@ -196,7 +200,7 @@ std::shared_ptr<RadixKvNode> RadixConvCache::insert_sequence(
                 // Exact match ends at this node
                 if (is_system_prompt) matched_child->is_system_prompt.store(true, std::memory_order_relaxed);
                 if (is_pinned) matched_child->is_pinned.store(true, std::memory_order_relaxed);
-                if (block) {
+                if (block && config_.host_ram_budget_bytes > 0) {
                     total_ram_bytes_ -= matched_child->ram_bytes;
                     matched_child->kv_block = std::move(block);
                     matched_child->ram_bytes = matched_child->compute_ram_bytes();
@@ -276,7 +280,7 @@ std::shared_ptr<RadixKvNode> RadixConvCache::insert_sequence(
             // Target sequence ends exactly at split_node
             if (is_system_prompt) split_node->is_system_prompt.store(true, std::memory_order_relaxed);
             if (is_pinned) split_node->is_pinned.store(true, std::memory_order_relaxed);
-            if (block) {
+            if (block && config_.host_ram_budget_bytes > 0) {
                 split_node->kv_block = std::move(block);
             }
             split_node->ram_bytes = split_node->compute_ram_bytes();
@@ -304,7 +308,9 @@ std::shared_ptr<RadixKvNode> RadixConvCache::insert_sequence(
         new_node->is_system_prompt.store(is_system_prompt, std::memory_order_relaxed);
         new_node->is_pinned.store(is_pinned, std::memory_order_relaxed);
         new_node->last_accessed_us.store(now, std::memory_order_relaxed);
-        new_node->kv_block = std::move(block);
+        if (config_.host_ram_budget_bytes > 0) {
+            new_node->kv_block = std::move(block);
+        }
         new_node->ram_bytes = new_node->compute_ram_bytes();
 
         split_node->children.push_back(new_node);
@@ -646,6 +652,9 @@ std::vector<std::shared_ptr<KvBlock>> RadixConvCache::get_branch_blocks(uint64_t
 }
 
 bool RadixConvCache::set_kv_block(uint64_t node_id, std::shared_ptr<KvBlock> block) {
+    if (config_.host_ram_budget_bytes == 0) {
+        return false;
+    }
     std::unique_lock<std::shared_mutex> lock(rw_mu_);
     auto it = node_map_.find(node_id);
     if (it == node_map_.end()) return false;
