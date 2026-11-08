@@ -30,7 +30,7 @@ agents. Your chats and files stay on your PC.
 - **Free.** MIT license, no account, no cloud.
 - **Private.** No telemetry. The server listens on `127.0.0.1` and never binds past loopback without an API key.
 
-Engine 0.1.48 (the same engine upstream ships, built from this repository). Every model size with its exact
+Engine 0.1.49 (the same engine upstream ships, built from this repository). Every model size with its exact
 download size: `python3 prepare.py --list`.
 
 ## What you need
@@ -239,7 +239,7 @@ What the pieces are:
   Gyro GGUF) — leave it out for every other family.
 - `--spec 4 --spec-min-p 0.5 --mtp` are the guess-and-check settings from [How does it work?](#how-does-it-work),
   against step c's draft. `--max-context` is what your RAM allows (131072 on a 64 GB PC). `--kv int8
-  --mmap-experts` are the defaults; keep them.
+  --mmap-experts` are the defaults; keep them (`--kv q4s` halves KV memory with searched 4-bit scale precision).
 - `--expert-profile` is a shipped ranking of which experts a 12-16 GB card reads most (`data/expert-profile.bin`;
   the Coder uses `data/expert-profile-coder.bin`). The other families set none.
 - `model_name` is the name clients see in `/v1/models`. `vision` turns pictures on (`gpu: false` is the CPU

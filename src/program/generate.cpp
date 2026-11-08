@@ -68,6 +68,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q4s.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -841,6 +842,8 @@ void usage() {
                  "                       VRAM; default fp16 until gate G-C accepts int8\n"
                  "  --kv q4_0            4-bit K/V after a Hadamard rotation (PR #21): half of int8's memory,\n"
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
+                 "  --kv q4s             sixteen values per block, searched e4m3 scale (same bytes as q4_0, closer\n"
+                 "                       to fp16)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
@@ -3197,12 +3200,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "q4s") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4 or q4s\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    strata::core::qsa_set_kv_q4s(o.kv == "q4s");   // q4s: sixteen values per block, a searched e4m3 scale (kv_q4s.hpp)
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
     const char* kv_rot = std::getenv("STRATA_KV_ROT");
@@ -4748,8 +4752,8 @@ int main(int argc, char** argv) {
         //
         // chunk_bytes uses a no-alloc fake SessionState.  qsa_state_init is NOT used: with base=nullptr it would
         // cudaMemcpy a null page table and kv_stream_reset a null map (CUDA "invalid argument") on a streamed
-        // state.  bytes_needed only reads max_cells and kv_mode/n_pages/kv_int8/kv_q4/kv_hybrid, so we set those
-        // fields directly, replicating kv_plan's arithmetic (layer.cpp:634) with the public getters.
+        // state.  bytes_needed only reads max_cells and kv_mode/n_pages/kv_int8/kv_q4/kv_q4s/kv_hybrid, so we set
+        // those fields directly, replicating kv_plan's arithmetic (layer.cpp:634) with the public getters.
         auto chunk_bytes = [&](int64_t lb, int64_t c) -> uint64_t {
             strata::core::qsa_set_kv_resident(o.kv_resident);
             const strata::kernels::QsaShapes s = strata::core::qsa_shapes(g);
@@ -4761,8 +4765,9 @@ int main(int argc, char** argv) {
                 if (r < pages) mode = 1;
             }
             const bool q4 = strata::core::qsa_kv_q4();
+            const bool q4s = strata::core::qsa_kv_q4s();
             const bool hyb = strata::core::qsa_kv_hybrid();
-            const bool i8 = strata::core::qsa_kv_int8() && !q4;
+            const bool i8 = strata::core::qsa_kv_int8() && !q4 && !q4s;
             std::vector<strata::core::QsaState> qs((size_t) g.n_qsa_layers());
             for (int64_t j = 0; j < g.n_qsa_layers(); ++j) {
                 qs[(size_t) j].max_cells = o.max_context;
@@ -4770,6 +4775,7 @@ int main(int argc, char** argv) {
                 qs[(size_t) j].n_pages = pages;
                 qs[(size_t) j].kv_int8 = i8;
                 qs[(size_t) j].kv_q4 = q4;
+                qs[(size_t) j].kv_q4s = q4s;
                 qs[(size_t) j].kv_hybrid = hyb;
             }
             strata::core::SessionState ss{};
@@ -8358,6 +8364,7 @@ int main(int argc, char** argv) {
             radix_cfg.format = (o.kv == "int8") ? strata::core::kKvInt8
                              : (o.kv == "k8v4") ? strata::core::kKvHybrid
                              : (o.kv == "q4_0") ? strata::core::kKvQ4
+                             : (o.kv == "q4s") ? strata::core::kKvQ4S
                              : strata::core::kKvF16;
             radix_cfg.num_layers = static_cast<uint32_t>(g.n_layers);
             radix_cfg.num_heads = static_cast<uint32_t>(g.n_head_kv);
@@ -15367,6 +15374,9 @@ int main(int argc, char** argv) {
                     if (st.kv_q4) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
+                    } else if (st.kv_q4s) {
+                        const int64_t q4sb = (int64_t) strata::kernels::kv_q4s_bytes_per_head((int) qs.head_dim);
+                        a = {{h ? st.host.k_q4s : st.k_q4s, q4sb}, {h ? st.host.v_q4s : st.v_q4s, q4sb}};
                     } else if (st.kv_hybrid) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q : st.k_q, kvb}, {h ? st.host.v_q4 : st.v_q4, q4b},

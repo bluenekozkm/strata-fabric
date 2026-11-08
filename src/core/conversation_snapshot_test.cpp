@@ -1,6 +1,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q4s.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -48,10 +49,12 @@ struct Fixture {
     }
     Fixture(int fmt, int mode) {
         auto& st = state;
-        st.kv_mode = mode; st.kv_int8 = fmt==kKvInt8; st.kv_q4 = fmt==kKvQ4; st.kv_hybrid = fmt==3;
+        st.kv_mode = mode; st.kv_int8 = fmt==kKvInt8; st.kv_q4 = fmt==kKvQ4; st.kv_q4s = fmt==kKvQ4S; st.kv_hybrid = fmt==3;
         st.n_pages = 24; st.n_slots = mode ? 4 : st.n_pages;
         st.max_cells = st.n_pages * 4; st.idx_pooled_rows = mode==2 ? 2 : st.max_cells/4+2;
-        const size_t per = fmt==kKvQ4 ? kv_q4_bytes_per_head((int)g.head_dim) : g.head_dim*((st.kv_int8 || st.kv_hybrid) ? 1:2);
+        const size_t per = fmt==kKvQ4 ? kv_q4_bytes_per_head((int)g.head_dim)
+                         : fmt==kKvQ4S ? kv_q4s_bytes_per_head((int)g.head_dim)
+                         : g.head_dim*((st.kv_int8 || st.kv_hybrid) ? 1:2);
         const size_t rows = st.max_cells*g.n_head_kv, slot_rows = st.n_slots*4*g.n_head_kv;
         sizes = {rows*per, rows*per, fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0,
                  fmt==kKvInt8 ? rows*(g.head_dim/64)*2:0, (size_t)st.idx_pooled_rows*g.idx_key_dim*4};
@@ -64,6 +67,10 @@ struct Fixture {
             alloc(st.k_q4,slot_rows*per); alloc(st.v_q4,slot_rows*per);
             if (mode) {alloc(st.host.k_q4,sizes[0],true); alloc(st.host.v_q4,sizes[1],true);}
             sources[0]=mode?st.host.k_q4:st.k_q4; sources[1]=mode?st.host.v_q4:st.v_q4;
+        } else if (fmt==kKvQ4S) {
+            alloc(st.k_q4s,slot_rows*per); alloc(st.v_q4s,slot_rows*per);
+            if (mode) {alloc(st.host.k_q4s,sizes[0],true); alloc(st.host.v_q4s,sizes[1],true);}
+            sources[0]=mode?st.host.k_q4s:st.k_q4s; sources[1]=mode?st.host.v_q4s:st.v_q4s;
         } else if (fmt==kKvInt8) {
             alloc(st.k_q,slot_rows*per); alloc(st.v_q,slot_rows*per);
             alloc(st.k_scale,slot_rows*(g.head_dim/64)*2); alloc(st.v_scale,slot_rows*(g.head_dim/64)*2);
@@ -305,7 +312,7 @@ void full_session(int fmt, int mode, int experts) {
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
-    for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
+    for (int fmt : std::array<int,5>{kKvF16,kKvInt8,kKvQ4,kKvQ4S,3}) for (int mode : {0,1,2}) {
         if (fmt==3 && mode!=0) continue;
         Fixture f(fmt,mode);
         if (fmt==3) {
@@ -374,7 +381,8 @@ int main() {
                 const size_t block=kv_block_bytes(s,fmt)/2;
                 // Codes and scales are separate in INT8; check code bytes here.
                 const size_t code_block=fmt==kKvInt8 ? s.page_size*s.n_head_kv*s.head_dim : block;
-                const void* slots=fmt==kKvQ4?(void*)f.state.k_q4:fmt==kKvInt8?(void*)f.state.k_q:(void*)f.state.k_pool;
+                const void* slots=fmt==kKvQ4?(void*)f.state.k_q4:fmt==kKvQ4S?(void*)f.state.k_q4s:
+                                  fmt==kKvInt8?(void*)f.state.k_q:(void*)f.state.k_pool;
                 std::vector<uint8_t> got(code_block);
                 for (int64_t page=b0;page<b1;++page) {
                     cuda_check(cudaMemcpy(got.data(),(const uint8_t*)slots+(page%f.state.n_slots)*code_block,code_block,cudaMemcpyDeviceToHost));
@@ -396,13 +404,28 @@ int main() {
                 check(!conversation_kv_restore(rotated,f.state,f.g,upto,index,err),"rotated image into an unrotated state rejected");
                 check(conversation_kv_restore(a,f.state,f.g,upto,index,err),"unrotated image still restores");
             }
+            if (fmt==kKvQ4S) {
+                // a q4s snapshot is its own format id: the bytes match q4_0's, so only the id tells the images
+                // apart - a q4s image never restores into a q4_0 state, nor the reverse. And kv_rot does not change
+                // the id: q4s is always rotated, nothing to tell apart (conversation_snapshot.cpp).
+                f.state.kv_q4s=false; f.state.kv_q4=true;
+                check(!conversation_kv_restore(a,f.state,f.g,upto,index,err),"q4s image into a q4_0 state rejected");
+                f.state.kv_q4=false; f.state.kv_q4s=true;
+                f.state.kv_rot=true;
+                ConversationKv rotated;
+                check(conversation_kv_save(rotated,f.state,f.g,upto,index,err),"save rotated q4s");
+                check(rotated.format==a.format,"q4s is always rotated: kv_rot does not change the format id");
+                check(conversation_kv_restore(rotated,f.state,f.g,upto,index,err),"rotated q4s image restores");
+                f.state.kv_rot=false;
+                check(conversation_kv_restore(a,f.state,f.g,upto,index,err),"q4s image still restores");
+            }
             if (!a.k.empty()) {
                 bad=a; bad.k.pop_back();
                 check(!conversation_kv_restore(bad,f.state,f.g,upto,index,err),"reject malformed payload");
             }
         }
     }
-    for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
+    for (int fmt : {kKvF16,kKvInt8,kKvQ4,kKvQ4S}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int experts : {256,512}) full_session(3,0,experts);
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);

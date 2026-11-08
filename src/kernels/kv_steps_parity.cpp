@@ -1,10 +1,12 @@
-// src/kernels/kv_steps_parity.cpp - the batched K/V append (#783 PR-d): kv_append_q8_steps / kv_append_q4_steps for
-// n = 1..8 cells in one launch against n calls of the single-cell append, memcmp on every pool byte.
+// src/kernels/kv_steps_parity.cpp - the batched K/V append (#783 PR-d): kv_append_q8_steps / kv_append_q4_steps /
+// kv_append_q4s_steps for n = 1..8 cells in one launch against n calls of the single-cell append, memcmp on every
+// pool byte.
 //
 // Cells land at scattered positions through a non-identity page table; the K/V rows are random with small, large and
-// all-zero groups. Three layouts: INT8 K and V, Q4_0 K and V, and the K8V4 hybrid's folded call (the K pool passed as
-// both halves, one plane). GPU, synthetic, no model.
+// all-zero groups. Four layouts: INT8 K and V, Q4_0 K and V, Q4S K and V (kv_q4s.hpp), and the K8V4 hybrid's folded
+// call (the K pool passed as both halves, one plane). GPU, synthetic, no model.
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q4s.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa.hpp"
 
@@ -62,6 +64,7 @@ int main() {
     uint16_t *ks1 = dalloc<uint16_t>(q8s), *vs1 = dalloc<uint16_t>(q8s), *ks2 = dalloc<uint16_t>(q8s), *vs2 = dalloc<uint16_t>(q8s);
     uint8_t *k41 = dalloc<uint8_t>(q4n), *v41 = dalloc<uint8_t>(q4n), *k42 = dalloc<uint8_t>(q4n), *v42 = dalloc<uint8_t>(q4n);
     uint8_t *h41 = dalloc<uint8_t>(q4n), *h42 = dalloc<uint8_t>(q4n);
+    uint8_t *k4s1 = dalloc<uint8_t>(q4n), *v4s1 = dalloc<uint8_t>(q4n), *k4s2 = dalloc<uint8_t>(q4n), *v4s2 = dalloc<uint8_t>(q4n);
     int8_t *hq1 = dalloc<int8_t>(q8n), *hq2 = dalloc<int8_t>(q8n);
     uint16_t *hs1 = dalloc<uint16_t>(q8s), *hs2 = dalloc<uint16_t>(q8s);
 
@@ -71,6 +74,7 @@ int main() {
             zero(kq1, q8n); zero(vq1, q8n); zero(kq2, q8n); zero(vq2, q8n);
             zero(ks1, q8s); zero(vs1, q8s); zero(ks2, q8s); zero(vs2, q8s);
             zero(k41, q4n); zero(v41, q4n); zero(k42, q4n); zero(v42, q4n); zero(h41, q4n); zero(h42, q4n);
+            zero(k4s1, q4n); zero(v4s1, q4n); zero(k4s2, q4n); zero(v4s2, q4n);
             zero(hq1, q8n); zero(hq2, q8n); zero(hs1, q8s); zero(hs2, q8s);
             std::vector<int> positions(cells);
             for (int i = 0; i < cells; ++i) positions[i] = i;
@@ -101,11 +105,13 @@ int main() {
                 const float* vc = d_v + (size_t) t * H * D;
                 k::kv_append_q8_step(kq1, vq1, ks1, vs1, d_table, st, kc, vc, s, nullptr);
                 k::kv_append_q4_step(k41, v41, d_table, st, kc, vc, s, nullptr);
+                k::kv_append_q4s_step(k4s1, v4s1, d_table, st, kc, vc, s, nullptr);
                 k::kv_append_q8_step(hq1, hq1, hs1, hs1, d_table, st, kc, kc, s, nullptr);      // the hybrid's folded K call
                 k::kv_append_q4_step(h41, h41, d_table, st, vc, vc, s, nullptr);                // ... and its folded V call
             }
             k::kv_append_q8_steps(kq2, vq2, ks2, vs2, d_table, d_step, k::kStepCount, d_k, d_v, H * D, n, s, nullptr, nullptr);
             k::kv_append_q4_steps(k42, v42, d_table, d_step, k::kStepCount, n, d_k, d_v, s, nullptr);
+            k::kv_append_q4s_steps(k4s2, v4s2, d_table, d_step, k::kStepCount, n, d_k, d_v, s, nullptr);
             k::kv_append_q8_steps(hq2, hq2, hs2, hs2, d_table, d_step, k::kStepCount, d_k, d_k, H * D, n, s, nullptr, nullptr);
             k::kv_append_q4_steps(h42, h42, d_table, d_step, k::kStepCount, n, d_v, d_v, s, nullptr);
             ck(cudaDeviceSynchronize(), "sync");
@@ -115,6 +121,7 @@ int main() {
                 {"INT8 K/V codes", same(fetch(kq1, q8n).data(), fetch(kq2, q8n).data(), q8n) && same(fetch(vq1, q8n).data(), fetch(vq2, q8n).data(), q8n)},
                 {"INT8 K/V scales", same(fetch(ks1, q8s).data(), fetch(ks2, q8s).data(), q8s * 2) && same(fetch(vs1, q8s).data(), fetch(vs2, q8s).data(), q8s * 2)},
                 {"Q4_0 K/V", same(fetch(k41, q4n).data(), fetch(k42, q4n).data(), q4n) && same(fetch(v41, q4n).data(), fetch(v42, q4n).data(), q4n)},
+                {"Q4S K/V", same(fetch(k4s1, q4n).data(), fetch(k4s2, q4n).data(), q4n) && same(fetch(v4s1, q4n).data(), fetch(v4s2, q4n).data(), q4n)},
                 {"hybrid K (folded INT8)", same(fetch(hq1, q8n).data(), fetch(hq2, q8n).data(), q8n) && same(fetch(hs1, q8s).data(), fetch(hs2, q8s).data(), q8s * 2)},
                 {"hybrid V (folded Q4_0)", same(fetch(h41, q4n).data(), fetch(h42, q4n).data(), q4n)},
             };

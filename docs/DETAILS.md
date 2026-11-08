@@ -96,6 +96,18 @@ VRAM. RTX 3090, the Coder at 198K context: 99 instead of 85 tokens/s output, the
 slower. It streams its KV cache like the other formats (`--kv-resident N`): on an RTX 2060 SUPER 8 GB at 128K with
 20,480 resident cells, +780 expert slots over resident K8V4, and it scores better than 4-bit KV on long documents.
 
+**Searched-scale 4-bit KV cache (0.1.49, optional):** `--kv q4s` is q4_0's rotation and q4_0's exact footprint
+(576 B per cell, 6.9 KB per token over the 12 QSA layers), but sixteen values per block instead of 32 and a scale
+searched per block instead of taken from the maximum: three candidates around the group's maximum, each rounded
+to an e4m3 byte, the smallest squared error wins. The full-range candidates represent both extremes exactly,
+which is where q4_0's precision went (its signed scale always clips one extreme a full step). Teacher-forced on
+the frozen quality set, q4s beats q4_0 on top-1 agreement (93.77% vs 93.29%), KL (0.0398 vs 0.0419) and
+perplexity (4.117 vs 4.142, fp16's 4.118), with q4_0's memory and expert slots (0.84 GiB of K/V in RAM at 131K
+against int8's 1.55 GiB, 5,199 vs 5,173 expert slots). Needles 8/8 to a 249K-token prompt; the 105K-token
+request decodes 28.3 tokens/s against q4_0's 26.4 and int8's 27.2, prompts like q4_0's (~11% slower than int8).
+It combines with `--kv-resident`, the tiered KV and MTP; its format id is its own, so cached blocks never mix.
+First grid measured worse; the shipped one came from a host RMSE study.
+
 **Reproducible greedy output (0.1.30, opt-in, `STRATA_IQ_MT_MIN=1`):** with the IQ models, the CPU computes an
 expert for one token with ggml's dot product and for several tokens with Strata's multi-token kernels, which round
 slightly differently. How many tokens share an expert depends on the drafts in a verify window, so the same prompt
@@ -1852,6 +1864,8 @@ test images.
 **0.1.47: the mapped pack gets the guard too (`--mmap-experts`), and it re-runs at every prompt-chunk boundary.** The mapped tier's copies are memory copies out of the file's pages, and one session can flip the cache warm and then collapsed (a 16K prompt streams 47-53 GB of experts through a ~24 GB page cache; the first request after a 16K run stalled until this). So the engine re-runs the `mincore` sample at each chunk boundary (sub-millisecond) and picks between two profiles: a warm cache keeps the RAM knobs and the memory copies; a cold one reads each blob with one whole-blob `pread` instead of faulting the mapping page by page (non-Linux keeps the memory copies outright). On the RX 9070 XT / NVMe PC (32 GB of RAM) a collapsed cache faulted the mapping at ~140-170 MB/s and a 16K prompt took 164-277 s to first token; the `pread` reads it at 1.7-1.8 GB/s with about a hundred faults per request, and a warm session runs as before. The deep ring's pinned host buffers are sized once for the deepest shape (128 blobs, ~177 MB here) even if the cache never collapses. `STRATA_STAGER_SSD=1` / `0` forces either profile here too; `STRATA_STAGER_THREADS` still pins one for the whole run. The bytes each request sees are the same.
 
 **0.1.48 (an experimental build): the guard works on big pages, and says its line once.** The GGUF branch of the `mincore` sample still hardcoded a 4,096-byte page: on a 64K-page kernel `mincore` answered EINVAL and the sample answered "not cached" for ever, so the warm guard silently never fired and a fully cached pack kept the slow SSD profile. One `sysconf(_SC_PAGESIZE)` now serves both tiers' samples. The chunk-boundary re-pick also printed its RAM-profile line at every chunk once the cache sat warm; it prints once per flip. 0.1.47 and 0.1.48 ship together in one experimental build, and the numbers in these two paragraphs are from one PC: an RX 9070 XT with 32 GB of RAM and an NVMe drive.
+
+**0.1.49: searched-scale 4-bit KV storage (`--kv q4s`).** Halves KV cache memory footprint (576 B per cell, identical to q4_0) while cutting perplexity loss to near zero by halving the group to 16 values and running a deterministic scale search (candidates $m \cdot \{1, 0.9, 0.8\} / 7$ rounded to e4m3 bits). Bit-identical on host and device, fully compatible with KV streaming (`--kv-resident`), tiered KV cache and MTP.
 
 ## Short prompts: the CPU shares the experts (on by default on one NVIDIA GPU, `STRATA_PREFILL_CPU_SHARE`)
 

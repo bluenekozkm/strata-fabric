@@ -37,6 +37,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q4s.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
@@ -1512,17 +1513,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
-                // STRATA_DF_QB_Q4 (default on since 0.1.45; STRATA_DF_QB_Q4=0 gives the old token-by-token path): a Q4_0 KV cache
-                // takes the batched window too - its one per-token extra, the query's rotation, is row-wise and the batched
-                // path rotates (270650e).  The generated ids are identical (p620 gfx1201, A4000 sm_86, P100 sm_60, short and
-                // long prompts), and the 6-token verify graph is 1950 nodes instead of 2610 (#2403: an RX 6900 XT faulted in
-                // the first verify graph launch with --kv q4_0 + KV streaming + MTP; whether the graph size is the cause is
-                // not confirmed)
+                // STRATA_DF_QB_Q4 (default on since 0.1.45; STRATA_DF_QB_Q4=0 gives the old token-by-token path): a Q4_0 or
+                // q4s KV cache takes the batched window too - its one per-token extra, the query's rotation, is row-wise and
+                // the batched path rotates (270650e).  The generated ids are identical (p620 gfx1201, A4000 sm_86, P100 sm_60,
+                // short and long prompts), and the 6-token verify graph is 1950 nodes instead of 2610 (#2403: an RX 6900 XT
+                // faulted in the first verify graph launch with --kv q4_0 + KV streaming + MTP; whether the graph size is the
+                // cause is not confirmed)
                 static const bool qb_q4 = [] {
                     const char* e = std::getenv("STRATA_DF_QB_Q4");
                     return e == nullptr || std::atoi(e) != 0;
                 }();
-                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() &&
+                                (st.kv_q4 || st.kv_q4s ? qb_q4 : true);
                 if (!q8_attn) quant_in(xm, (int) N);
                 // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
                 // beside the K/V side; the indexer query joins before the block scores, the query before attention
@@ -1692,6 +1694,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     } else if (st.kv_q4)
                         kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
                                            &st.host);
+                    else if (st.kv_q4s)
+                        kv_append_q4s_steps(st.k_q4s, st.v_q4s, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
+                                            &st.host);
                     else if (st.kv_int8)
                         kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
                                            kc_b, vc_b, (int) (NKV * HD), n, s, cs, &st.host);
@@ -1713,6 +1718,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     } else if (st.kv_q4)
                         kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kcur_ + t * NKV * HD,
                                           vcur_ + t * NKV * HD, s, cs, &st.host);
+                    else if (st.kv_q4s)
+                        kv_append_q4s_step(st.k_q4s, st.v_q4s, st.page_table, step_t, kcur_ + t * NKV * HD,
+                                           vcur_ + t * NKV * HD, s, cs, &st.host);
                     else if (st.kv_int8)
                         kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);

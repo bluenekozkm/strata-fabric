@@ -310,7 +310,7 @@ KvBlockError kv_block_serialize(const KvBlock& block,
         return KvBlockError::kMisalignedBuffer;
     }
 
-    if (block.header.format < kKvF16 || block.header.format > kKvHybrid) {
+    if (block.header.format < kKvF16 || block.header.format > kKvQ4S) {
         return KvBlockError::kInvalidFormat;
     }
 
@@ -440,7 +440,7 @@ KvBlockError kv_block_deserialize(const uint8_t* buffer,
         return KvBlockError::kUnsupportedVersion;
     }
 
-    if (hdr.format < kKvF16 || hdr.format > kKvHybrid) {
+    if (hdr.format < kKvF16 || hdr.format > kKvQ4S) {
         return KvBlockError::kInvalidFormat;
     }
 

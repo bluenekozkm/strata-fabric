@@ -86,12 +86,14 @@ void test_cas_hash_determinism_and_chaining() {
     // 5. Metadata sensitivity: changing format or geometry changes hash
     uint64_t h_hybrid = kv_block_hash(0, tokens_a.data(), tokens_a.size(), kKvHybrid, 1, 2, 256);
     uint64_t h_q4 = kv_block_hash(0, tokens_a.data(), tokens_a.size(), kKvQ4, 1, 2, 256);
+    uint64_t h_q4s = kv_block_hash(0, tokens_a.data(), tokens_a.size(), kKvQ4S, 1, 2, 256);
     uint64_t h_layers2 = kv_block_hash(0, tokens_a.data(), tokens_a.size(), kKvInt8, 2, 2, 256);
     uint64_t h_heads4 = kv_block_hash(0, tokens_a.data(), tokens_a.size(), kKvInt8, 1, 4, 256);
     uint64_t h_dim128 = kv_block_hash(0, tokens_a.data(), tokens_a.size(), kKvInt8, 1, 2, 128);
 
     CHECK(h_hybrid != h1);
     CHECK(h_q4 != h1);
+    CHECK(h_q4s != h1);
     CHECK(h_layers2 != h1);
     CHECK(h_heads4 != h1);
     CHECK(h_dim128 != h1);
@@ -140,6 +142,11 @@ void test_round_trip_format(int format, const char* format_name) {
         const size_t q4_bytes = layers * num_cells * heads * (head_dim / 32 * 18);
         block.payload.k_data = make_random_bytes(q4_bytes, 301);
         block.payload.v_data = make_random_bytes(q4_bytes, 302);
+    } else if (format == kKvQ4S) {
+        // Q4S: Both K and V are q4s (kv_q4s.hpp: one e4m3 scale + 8 code bytes per 16 values, q4_0's 144 B/cell-head)
+        const size_t q4s_bytes = layers * num_cells * heads * (head_dim / 16 * 9);
+        block.payload.k_data = make_random_bytes(q4s_bytes, 311);
+        block.payload.v_data = make_random_bytes(q4s_bytes, 312);
     } else if (format == kKvF16) {
         // FP16: Both K and V are fp16 (2 bytes per val)
         const size_t f16_bytes = layers * num_cells * heads * head_dim * sizeof(uint16_t);
@@ -200,6 +207,7 @@ void test_serialize_deserialize_round_trip() {
     test_round_trip_format(kKvInt8, "INT8");
     test_round_trip_format(kKvHybrid, "K8V4 (Hybrid)");
     test_round_trip_format(kKvQ4, "Q4_0");
+    test_round_trip_format(kKvQ4S, "Q4S (searched scale)");
     test_round_trip_format(kKvF16, "FP16");
 }
 

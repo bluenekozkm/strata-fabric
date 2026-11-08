@@ -9,6 +9,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q4s.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -88,13 +89,16 @@ __device__ __forceinline__ uint32_t pack_h2(float lo_k, float hi_k) {   // eleme
 // KV_MODE 4 (Q4_0 K and V, `--kv q4_0`): mode 1 with a scale per 32 values - each q4_0 block's codes enter as exact
 // int8 (code - 8) and its fp16 scale is applied in FP32, as mode 1's are; the caller rotates q and un-rotates the
 // output (kv_q4.hpp).
+// KV_MODE 5 (q4s K and V, `--kv q4s`): mode 4 with a scale per 16 values - each block_q4s's codes enter as exact
+// int8 and its e4m3 scale is applied in FP32, as mode 4's fp16 scale is; the caller rotates q and un-rotates the
+// output (kv_q4s.hpp).
 template <int KV_MODE, bool PF = false>
 struct Smem {
     using KElem = typename std::conditional<KV_MODE == 0, __half, int8_t>::type;
-    using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4, int8_t, __half>::type;
+    using VElem = typename std::conditional<KV_MODE == 1 || KV_MODE == 4 || KV_MODE == 5, int8_t, __half>::type;
     static constexpr int KROW = KV_MODE == 0 ? HD + 8 : HD + 16;   // elements; 16-byte aligned rows, banks spread
-    static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4) ? HD + 16 : HD + 8;
-    static constexpr int NG = KV_MODE == 4 ? HD / QK4_0 : 4;      // scale groups per row (q4_0: 8 of 32, else 4 of 64)
+    static constexpr int VROW = (KV_MODE == 1 || KV_MODE == 4 || KV_MODE == 5) ? HD + 16 : HD + 8;
+    static constexpr int NG = KV_MODE == 5 ? HD / QK4S_GROUP : KV_MODE == 4 ? HD / QK4_0 : 4;   // scale groups per row (q4_0: 8 of 32, q4s: 16 of 16, else 4 of 64)
     __half qh[16][QS];
     __half ql[16][QS];
     // int8 K/V (mode 1): K is read only by the scores and V only by p.v, so they share one buffer - V is stored over K
@@ -243,6 +247,32 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                 reinterpret_cast<uint4*>(dst)[1] = hi;
                 (kv == 0 ? S.ks : S.vs)[c][b] = d;
             }
+        } else if constexpr (KV_MODE == 5) {
+            // q4s K and V: one (K or V, cell, block) per item - the block's 8 code bytes (1-byte aligned: byte
+            // loads) become 16 exact int8 codes (element 2j in the low nibble of byte j, 2j + 1 in the high one),
+            // its e4m3 scale goes to ks/vs
+            constexpr int BLKS = HD / QK4S_GROUP;
+            constexpr int BYTES = BLKS * (int) sizeof(block_q4s);
+            for (int i = t; i < 2 * CH * BLKS; i += THREADS) {
+                const int kv = i / (CH * BLKS), rem = i % (CH * BLKS), c = rem / BLKS, b = rem % BLKS;
+                const long long r = S.row[c];
+                float d = 0.0f;
+                uint64_t w = 0;
+                if (r >= 0) {
+                    const block_q4s* blk = reinterpret_cast<const block_q4s*>((kv == 0 ? p.k_q4s : p.v_q4s) + r * BYTES) + b;
+                    d = e4m3_decode(__ldg(&blk->d));
+#pragma unroll
+                    for (int j = 0; j < QK4S_GROUP / 2; ++j) w |= (uint64_t) __ldg(blk->qs + j) << (8 * j);
+                }
+                int8_t* dst = kv == 0 ? &S.kv.k[c][b * QK4S_GROUP] : &S.kv.v[c][b * QK4S_GROUP];
+#pragma unroll
+                for (int j = 0; j < QK4S_GROUP / 2; ++j) {
+                    const uint8_t byte = (uint8_t) (w >> (8 * j));
+                    dst[2 * j] = (int8_t) ((byte & 0x0F) - 8);
+                    dst[2 * j + 1] = (int8_t) ((byte >> 4) - 8);
+                }
+                (kv == 0 ? S.ks : S.vs)[c][b] = d;
+            }
         } else {
             constexpr int KPIECES = HD * (int) sizeof(typename Smem<KV_MODE>::KElem) / 16;   // per K row
             for (int i = t; i < CH * KPIECES; i += THREADS) {
@@ -312,7 +342,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
         }
         __syncthreads();
         }
-        // scores: warp w takes cells 8w..8w+7 (one n-tile) over all 256 dims, per scale group (64 dims; q4_0's 32)
+        // scores: warp w takes cells 8w..8w+7 (one n-tile) over all 256 dims, per scale group (64 dims; q4_0's 32; q4s's 16)
         constexpr int NG = Smem<KV_MODE>::NG, KPG = HD / 16 / NG;   // groups per row, 16-dim MMA steps per group
 #pragma unroll
         for (int nt = 0; nt < CH / 32; ++nt) {
@@ -395,10 +425,11 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
             }
         }
         __syncthreads();
-        // p.v: warp w owns dims [64w, 64w+64), which is int8 scale group w (q4_0: groups 2w and 2w+1, four n-tiles
-        // each). A group's scale is folded into p relative to the chunk's largest magnitude (q4_0's scales are signed:
-        // ggml's d = max / -8), times 2^14 (|p'| <= 2^14: inside FP16's range, its lo half out of the subnormals); the
-        // chunk's sum is then added to the running one in FP32 with the factor taken back out
+        // p.v: warp w owns dims [64w, 64w+64), which is one int8 scale group (q4_0: groups 2w and 2w+1, four n-tiles
+        // each; q4s: half of group 2w and half of 2w+1, two n-tiles each). A group's scale is folded into p relative
+        // to the chunk's largest magnitude (q4_0's scales are signed: ggml's d = max / -8; q4s's e4m3 scales are not),
+        // times 2^14 (|p'| <= 2^14: inside FP16's range, its lo half out of the subnormals); the chunk's sum is then
+        // added to the running one in FP32 with the factor taken back out
         {
             constexpr int GPW = NG / 4, JPG = 8 / GPW;   // scale groups per warp, n-tiles per group
             float vdown_g[GPW];
@@ -442,7 +473,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_kernel(const float* __res
                     const int j = gi * JPG + jj;
                     const int d = warp * 64 + j * 8 + gid;
                     uint32_t b[2];
-                    if constexpr (KV_MODE == 1 || KV_MODE == 4) {
+                    if constexpr (KV_MODE == 1 || KV_MODE == 4 || KV_MODE == 5) {
                         const uint32_t x0 = (uint8_t) S.kv.v[cA][d] | ((uint32_t) (uint8_t) S.kv.v[cA + 1][d] << 8);
                         const uint32_t x1 = (uint8_t) S.kv.v[cB][d] | ((uint32_t) (uint8_t) S.kv.v[cB + 1][d] << 8);
                         b[0] = i8x2_to_h2(x0);
@@ -2382,6 +2413,11 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !ids || !steps || !pools.page_table)
         return false;
     cudaStream_t st = (cudaStream_t) stream;
+    if (pools.k_q4s != nullptr) {   // q4s K and V (--kv q4s): mode 5, the q4_0 gate mirrored. Volta's kernel has
+        if (pools.v_q4s == nullptr) return false;   // no mode 5, and Turing keeps the FP32 kernel it falls back to
+        if (volta || turing) return false;
+        return launch<5>(q, pools, ids, steps, cap, s, attn, n_q, st);
+    }
     if (pools.k_q4 != nullptr) {   // Q4_0 K and V (--kv q4_0): mode 4.  STRATA_PROMPT_ATTN_Q4=0: the old kernel (A/B)
         static const bool q4_off = [] {
             const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
