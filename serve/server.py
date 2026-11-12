@@ -3894,6 +3894,11 @@ class Service:
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
         self.idle_unload_s = 0
+        self.sleep_timeout_s = 0                        # sleep mode: save the context, unload, restore on the next request
+        self.sleep_file = None                          # where the sleep session file is written (None: derived at start)
+        self.sleep_session = None                       # a session file sleep saved; ensure_loaded restores it on the wake
+        self.sleeps = 0                                 # how often the model went to sleep (status_lock)
+        self.wakes = 0                                  # how often its context came back (status_lock)
         self.min_free_vram_mib = 0
         self.before_load = None
         self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
@@ -4318,6 +4323,17 @@ class Service:
         print("[strata] the engine is running again", flush=True)
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
+        if self.sleep_session:                           # sleep unloaded it: the conversation it saved comes back
+            path, self.sleep_session = self.sleep_session, None
+            try:
+                r = self.engine.session_file("restore", path)
+                with self.status_lock:
+                    self.wakes += 1
+                print(f"[strata] the model is awake and its conversation from before sleep is back "
+                      f"({r.get('tokens')} tokens)", flush=True)
+            except Exception as e:                       # noqa: BLE001 - the engine runs, without the old context
+                print(f"[strata] the conversation saved before sleep was not restored ({e}); the next request "
+                      "prefills it again", flush=True)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
@@ -4446,6 +4462,80 @@ class Service:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
+
+    def sleep_waiting(self, wait_s: float) -> str:
+        """sleep(), but a running or queued request is waited for (up to wait_s) instead of answering "busy",
+        like unload_waiting."""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        while True:
+            r = self.sleep()
+            if r != "busy" or time.monotonic() >= deadline:
+                return r
+            time.sleep(0.25)
+
+    def sleep(self, idle_for: float | None = None) -> str:
+        """Sleep mode: save the conversation the engine holds to sleep_file, then unload the engine - every byte of
+        VRAM and RAM goes back with its process, and the context does not: ensure_loaded() restores the file after
+        the engine's next start.  -> "sleeping", "not loaded", "busy" (a request is running or waiting, or with
+        idle_for: one ran more recently than that) or "unsupported".  A refused or failed save raises
+        (SessionRefused, EngineDied, EngineStuck) and keeps the model loaded."""
+        if not hasattr(self.engine, "session_file") or getattr(self.engine, "batch", 0):
+            return "unsupported"                        # #465's reason: a session file could interleave with a
+        if not self.sleep_file:                         # request being admitted, so the two are not combined
+            return "unsupported"
+        if not self.fifo.acquire(blocking=False):
+            return "busy"
+        try:
+            if not self.engine.alive():
+                return "not loaded"
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued"):
+                    return "busy"
+            if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+                return "busy"
+            self.last_request_at = time.time()
+            with self.status_lock:
+                self.status.update(busy=True, phase="putting the model to sleep", started=time.time(),
+                                   first_token=None, prompt_tokens=None, generated=None, max_tokens=None)
+            try:
+                if getattr(self.engine, "session_save_reclaim", False):
+                    from serve.session_save_retry import session_file
+                    r = session_file(self, "save", self.sleep_file, SessionRefused)
+                else:
+                    r = self.engine.session_file("save", self.sleep_file)
+            finally:
+                with self.status_lock:
+                    self.status["busy"] = False
+            self.engine.unload()
+            self.sleep_session = self.sleep_file         # the wake's promise, before anything else can fail
+            if self.vision is not None and hasattr(self.vision, "unload"):
+                self.vision.unload()
+            self.vision_held = False
+            with self.status_lock:
+                self.sleeps += 1
+            print(f"[strata] the model is asleep after saving its conversation ({r.get('tokens')} tokens to "
+                  f"{self.sleep_file}); the next request wakes it with the context back", flush=True)
+            return "sleeping"
+        finally:
+            self.fifo.release()
+
+    def start_idle_sleep(self):
+        if not self.sleep_timeout_s or not hasattr(self.engine, "session_file"):
+            return
+        print(f"[strata] the model sleeps after {self.sleep_timeout_s:g} s without requests; the conversation is "
+              f"kept at {self.sleep_file} and comes back with the next request", flush=True)
+
+        def loop():
+            while True:
+                time.sleep(max(1.0, min(30.0, self.sleep_timeout_s / 4)))
+                try:
+                    r = self.sleep(idle_for=self.sleep_timeout_s)
+                except (EngineStuck, SessionRefused, EngineDied) as e:   # tried again at the next turn
+                    print(f"[strata] idle sleep: {e}", flush=True)
+                    continue
+                if r == "unsupported":
+                    return                      # nothing can sleep here; stop asking
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -4585,7 +4675,7 @@ class Service:
         elif s.get("busy"):
             state = "generating"
         elif not self.loaded():
-            state = "unloaded"
+            state = "sleeping" if self.sleep_session else "unloaded"
         else:
             state = "idle"
         live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
@@ -4663,6 +4753,10 @@ class Service:
             ("strata:drafts_offered_total", "counter", "Speculative draft tokens offered", t["drafts_offered"]),
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
+            ("strata:model_sleeping", "gauge", "1 while the model sleeps with its conversation saved",
+             int(bool(self.sleep_session) and not self.loaded())),
+            ("strata:sleeps_total", "counter", "Times the model went to sleep", self.sleeps),
+            ("strata:wakes_total", "counter", "Times a sleep's conversation came back", self.wakes),
         ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
@@ -4686,6 +4780,7 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "sleeping": bool(self.sleep_session) and not self.loaded(),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -6681,10 +6776,11 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
-            if path in ("/unload", "/load") and not self._control_body():
+            if path in ("/unload", "/load", "/sleep") and not self._control_body():
                 return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
-            if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
+            if path in ("/unload", "/load", "/sleep") and \
+                    not self._own_page("the model can be loaded, unloaded or put to sleep"):
                 return
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
@@ -6707,6 +6803,20 @@ def make_handler(svc: Service):
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
+                return
+            if path == "/sleep":                             # sleep now: the conversation is saved, the VRAM/RAM goes back
+                r = None
+                try:
+                    wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0], svc.UNLOAD_WAIT_S)
+                    r = svc.sleep_waiting(wait_s) if wait_s else svc.sleep()
+                except (EngineStuck, EngineDied) as e:
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
+                except SessionRefused as e:                  # the save failed: the model stays loaded
+                    self._json(e.status, {"error": {"type": "server_error", "message": str(e), "kind": e.kind},
+                                          **({"published": True} if e.published else {})})
+                    return
+                self._json(409 if r == "busy" else 501 if r == "unsupported" else 200, {"status": r})
                 return
             reserved = False
             try:
@@ -6757,6 +6867,30 @@ def make_handler(svc: Service):
                         finally:
                             svc.fifo.release()
                         result = "loaded"
+                    self._json(200, {"status": result, **svc.v1_status()})
+                    return
+                if path == "/v1/sleep":                      # sleep now: the conversation is saved, the VRAM/RAM
+                    if not self._own_page("the model can be put to sleep"):   # goes back, the wake restores it
+                        return
+                    if req.get("model") not in (None, svc.model):
+                        self._json(404, {"error": {"message": "model not found"}})
+                        return
+                    wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0], svc.UNLOAD_WAIT_S)
+                    try:
+                        result = svc.sleep_waiting(wait_s) if wait_s else svc.sleep()
+                    except SessionRefused as e:              # the save failed: the model stays loaded
+                        body = {"error": {"type": "server_error", "message": str(e), "kind": e.kind}}
+                        if e.published:
+                            body["error"]["published"] = True
+                        self._json(e.status, body)
+                        return
+                    except (EngineStuck, EngineDied) as e:
+                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                        return
+                    if result == "busy":
+                        raise ModelBusy("a request is running or queued")
+                    if result == "unsupported":
+                        raise ValueError("sleep needs an engine that keeps session files and no parallel slots")
                     self._json(200, {"status": result, **svc.v1_status()})
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
@@ -8145,6 +8279,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
                          "in the config; default: never)")
+    ap.add_argument("--sleep-timeout", type=float, default=None, metavar="SECONDS",
+                    help="sleep mode: save the conversation, then unload the model after this many seconds without "
+                         "requests - all VRAM and RAM goes back, and the next request wakes it with the context "
+                         "restored (also \"sleep_timeout_s\" in the config; default: never)")
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503 (also "
                          "\"min_free_vram_mib\" in the config; default: always load)")
@@ -8502,6 +8640,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+    svc.sleep_timeout_s = a.sleep_timeout if a.sleep_timeout is not None else float(cfg.get("sleep_timeout_s") or 0)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
@@ -8522,6 +8661,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    # where sleep mode keeps the conversation: the config's "sleep_file", relative to the config's "cwd" (the
+    # engine's folder) like the config's slot_save_path; the default lands in the slot save directory when there
+    # is one, else the directory the server was started in
+    sf = cfg.get("sleep_file") or "sleep.strsess"
+    if not isinstance(sf, str) or not sf.strip():
+        raise SystemExit('[strata] config "sleep_file" must be a file path')
+    svc.sleep_file = os.path.abspath(os.path.join(svc.slot_save_path or cfg.get("cwd") or os.getcwd(), sf)
+                                     if not os.path.isabs(sf) else sf)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -8589,7 +8736,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
-    svc.start_idle_unload()
+    if svc.sleep_timeout_s:                         # sleep mode replaces the plain idle unload: it keeps the context
+        svc.start_idle_sleep()
+    else:
+        svc.start_idle_unload()
     svc.start_vision_idle()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "

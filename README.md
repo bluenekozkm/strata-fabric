@@ -379,6 +379,21 @@ processor's took 3.1 s. On 16 GB cards (Tesla P100 and RTX A4000, Linux) the car
 because it holds about 1.4 GB that the model would use otherwise. Details and measurements:
 [docs/DETAILS.md](docs/DETAILS.md#images-vision).
 
+### Sleep
+
+Sleep mode frees the model's whole memory and keeps the conversation. Start the server with `--sleep-timeout
+SECONDS` (or `"sleep_timeout_s"` in the run config): after that many seconds without requests the server saves the
+conversation, then stops the engine - the graphics card and the RAM it pinned go back to other programs. The next
+request starts the engine again and puts the conversation back, so a long chat does not start over.
+
+You can also put it to sleep yourself: `curl -X POST http://127.0.0.1:8080/v1/sleep -H "Content-Type: application/json"
+-d "{}"`. The saved conversation waits in `sleep_file` (next to the model by default, or in `--slot-save-path` when
+that is set); it holds the chat's token IDs and state, and is about 1.2 GB per 63,000-token conversation. Saving and
+restoring that size took 709.5 + 898.2 ms (measured; session files: [docs/DETAILS.md](docs/DETAILS.md)). `POST /sleep`
+does the same from the local page. `/metrics` reports the state as "sleeping", and Prometheus gets
+`strata:sleeps_total` and `strata:wakes_total`. Parallel requests (`--parallel`) cannot sleep yet, and plain idle
+unload (`--idle-unload`) is replaced by sleep while the flag is set.
+
 ### Good to know
 
 - Choose the thinking level (**off, low, medium or high**) with your app's "reasoning effort". Off is fastest.
