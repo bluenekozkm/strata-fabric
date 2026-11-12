@@ -224,10 +224,13 @@ def pctl(values, p):
 
 # ---------------------------------------------------------------------------------------------------- the suite
 class Suite:
-    def __init__(self, base, key, ctx, runs, think, log=print, want_clients=0, want_long=False, quick=False):
+    def __init__(self, base, key, ctx, runs, think, log=print, want_clients=0, want_long=False, quick=False,
+                 prefill_only=False, prompt_sizes=None):
         self.base, self.key, self.ctx, self.runs, self.think, self.log = base, key, ctx, runs, think, log
         self.clients, self.want_long = want_clients, want_long
         self.quick = quick
+        self.prefill_only = prefill_only
+        self.prompt_sizes = prompt_sizes
         self.nonce = str(int(time.time()))
         self.tokens_per_word, self.overhead = 1.1, 40
         self.out: dict = {"chat": {}, "prompts": {}, "agent": {}, "clients": {}, "skipped": {}, "failures": []}
@@ -402,14 +405,28 @@ class Suite:
 
     def run(self):
         self.warm_up()
-        self.run_chat()
-        self.run_prompt(4096, "4K")
-        self.run_prompt(16384, "16K")
-        self.run_agent()
-        if self.clients:
-            self.run_clients(self.clients)
-        if self.want_long:
-            self.run_prompt(32768, "32K")
+        if not self.prefill_only:
+            self.run_chat()
+        if self.prompt_sizes:
+            sizes = []
+            for item in self.prompt_sizes.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                val = int(item)
+                label = f"{val // 1024}K" if val % 1024 == 0 and val >= 1024 else str(val)
+                sizes.append((val, label))
+            for tok, lbl in sizes:
+                self.run_prompt(tok, lbl)
+        else:
+            self.run_prompt(4096, "4K")
+            self.run_prompt(16384, "16K")
+            if self.want_long:
+                self.run_prompt(32768, "32K")
+        if not self.prefill_only:
+            self.run_agent()
+            if self.clients:
+                self.run_clients(self.clients)
         return self.out
 
 
@@ -940,6 +957,8 @@ def main(argv=None) -> int:
     ap.add_argument("--clients", type=int, default=0, metavar="N", help="also send N requests at once")
     ap.add_argument("--long", action="store_true", help="also a prompt of about 32,768 tokens")
     ap.add_argument("--think", action="store_true", help="leave thinking on (the default suite turns it off)")
+    ap.add_argument("--prefill-only", action="store_true", help="only benchmark prompt prefill (skip chat questions and agent turns)")
+    ap.add_argument("--prompt-sizes", metavar="SIZES", help="comma-separated token sizes to benchmark (e.g. 1024,4096,16384)")
     ap.add_argument("--out", help="where to write the results folder (default: bench/results)")
     ap.add_argument("--compare", metavar="DIR", help="a results folder (or its results.json) to put beside this run")
     ap.add_argument("--compare-only", metavar="NEW", help="print --compare of two existing results folders and stop")
@@ -1000,20 +1019,25 @@ def main(argv=None) -> int:
                 return 1
         t0 = time.time()
         pre = collect_machine(base, key, cfg, a.gpu)
-        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients, want_long=a.long)
+        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say,
+                      want_clients=a.clients, want_long=a.long,
+                      prefill_only=a.prefill_only, prompt_sizes=a.prompt_sizes)
         slots = pre.get("parallel_slots") or 1
         if a.clients and a.clients > slots:
             say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly wait their turn.")
-        say("Running the suite (about 3-10 minutes) ...")
+        say("Running the suite (about 3-10 minutes) ..." if not a.prefill_only else "Running prefill benchmarks ...")
         out = suite.run()
         machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
         if not machine.get("gpu"):
             machine["gpu"] = pre.get("gpu")
         res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
                "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long, "started_server": started,
+                          "prefill_only": a.prefill_only,
                           "command": "python tools/strata_bench.py" + "".join(
                               f" {x}" for x in (f"--clients {a.clients}" if a.clients else "", "--long" if a.long else "",
-                                                "--think" if a.think else "", f"--runs {a.runs}" if a.runs != 3 else "") if x)},
+                                                "--think" if a.think else "", "--prefill-only" if a.prefill_only else "",
+                                                f"--prompt-sizes {a.prompt_sizes}" if a.prompt_sizes else "",
+                                                f"--runs {a.runs}" if a.runs != 3 else "") if x)},
                "elapsed_s": time.time() - t0, "machine": machine, "results": out}
         parent = Path(a.out) if a.out else ROOT / "bench" / "results"
         d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])

@@ -19,6 +19,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -443,7 +444,11 @@ def build_engine(a) -> None:
     run(["cmake", "-S", str(ROOT), "-B", str(bdir), "-G", "Ninja", *defs], env=dict(os.environ))
     run(["cmake", "--build", str(bdir), "--target", "strata"], env=dict(os.environ))
     shutil.copy2(bdir / EXE, eng / EXE)
-    stamp = {"source": f"local-{backend}", "backend": backend, "version": "local", "archs": archs.split(";")}
+    m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
+    version = m.group(1) if m else "local"
+    stamp = {"source": f"local-{backend}", "backend": backend, "version": version, "archs": archs.split(";")}
+    if (eng / (EXE.replace("strata", "strata-vision"))).is_file():
+        stamp["vision"] = "cpu"
     if backend == "hip":
         stamp["lib_dirs"] = hip_lib_dirs(hip_root(a.rocm))
     (eng / "BUILD.json").write_text(json.dumps(stamp, indent=1) + "\n", encoding="utf-8")
@@ -477,7 +482,24 @@ def main() -> int:
     ap.add_argument("--engine-path", help="use this engine binary in the run config instead of engine/strata")
     ap.add_argument("--force", action="store_true", help="overwrite an existing strata-<name>.json")
     ap.add_argument("--port", type=int, default=8080, help="the port written into the run config (default 8080)")
+    ap.add_argument("--repair", action="store_true", help="repair the environment: reinstall requirements and compile the engine")
     a = ap.parse_args()
+
+    if a.repair:
+        say("Repairing environment:")
+        pip = [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check"]
+        if (ROOT / "requirements.txt").is_file():
+            say("  reinstalling requirements.txt ...")
+            run(pip + ["--force-reinstall", "-r", str(ROOT / "requirements.txt")])
+        if (ROOT / "requirements-build.txt").is_file():
+            say("  reinstalling requirements-build.txt ...")
+            run(pip + ["--force-reinstall", "-r", str(ROOT / "requirements-build.txt")])
+        b = a.build or ("hip" if shutil.which("hipcc") or os.environ.get("ROCM_PATH") or (ROOT / "tools" / "hip").is_dir() else "cuda")
+        a.build = b
+        say(f"  building engine ({b}) ...")
+        build_engine(a)
+        ok("repair complete")
+        return 0
 
     if a.list or not (a.model or a.build):
         say("strata-fabric catalog (the engine reads the GGUF; the pack holds the tokenizer, and with --low-ram "
