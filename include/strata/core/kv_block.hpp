@@ -93,6 +93,17 @@ struct KvBlockPayload {
                recurrence.size();
     }
 
+    // the payload vectors are built by repeated resize(), so capacity can run up to 2x size while
+    // total_payload_bytes() (and every budget that counts it) only sees size; call before caching a block
+    void shrink_to_fit() {
+        token_ids.shrink_to_fit();
+        k_data.shrink_to_fit();
+        v_data.shrink_to_fit();
+        k_scale.shrink_to_fit();
+        v_scale.shrink_to_fit();
+        recurrence.shrink_to_fit();
+    }
+
     bool operator==(const KvBlockPayload& o) const = default;
 };
 

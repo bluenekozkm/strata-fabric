@@ -505,6 +505,7 @@ struct Options {
     bool exp_tiered_kv = false;        ///< enable experimental tiered KV cache (--exp-tiered-kv)
     std::string kv_disk_cache;         ///< persistent disk KV cache directory (empty = off)
     int64_t kv_disk_budget_mib = 10240; ///< SSD budget in MiB (default 10GB)
+    int64_t tiered_kv_ram_mib = 2048;  ///< radix tree host RAM budget in MiB (--tiered-kv-ram-mib, default 2GB)
     bool kv_multi_system_prompt = false; ///< enable host-side multi-branch radix tree cache
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
@@ -913,6 +914,8 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --tiered-kv-ram-mib N  --serve: radix tree host RAM budget in MiB with --exp-tiered-kv\n"
+                 "                       (default 2048; its own budget, not shared with --conversation-cache-mib)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
                  "  --memory-limit-mib N  --serve: the total RAM (MiB) this engine's container or cgroup may use, when\n"
@@ -2494,6 +2497,16 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.kv_disk_budget_mib = mb;
+        }
+        else if (a == "--tiered-kv-ram-mib") {
+            const char* v = next("--tiered-kv-ram-mib");
+            char* end = nullptr;
+            const long long mb = std::strtoll(v, &end, 10);
+            if (end == v || *end != '\0' || mb <= 0) {
+                std::fprintf(stderr, "strata generate: --tiered-kv-ram-mib expects a positive integer in MiB\n");
+                return 2;
+            }
+            o.tiered_kv_ram_mib = mb;
         }
         else if (a == "--kv-multi-system-prompt") {
             o.kv_multi_system_prompt = true;
@@ -8362,11 +8375,7 @@ int main(int argc, char** argv) {
                                      "cached KV states are volatile and will be lost on engine exit or restart!\n");
             }
 
-            radix_cfg.host_ram_budget_bytes = conversation_cache_mib_set
-                ? (static_cast<size_t>(std::max<int64_t>(0, o.conversation_cache_mib)) * 1024ULL * 1024ULL)
-                : (o.conversation_cache_mib > 0
-                    ? static_cast<size_t>(o.conversation_cache_mib) * 1024ULL * 1024ULL
-                    : (2ULL * 1024 * 1024 * 1024));
+            radix_cfg.host_ram_budget_bytes = static_cast<size_t>(o.tiered_kv_ram_mib) * 1024ULL * 1024ULL;
             radix_cfg.format = (o.kv == "int8") ? strata::core::kKvInt8
                              : (o.kv == "k8v4") ? strata::core::kKvHybrid
                              : (o.kv == "q4_0") ? strata::core::kKvQ4
@@ -8389,7 +8398,14 @@ int main(int argc, char** argv) {
 
         auto persist_tiered_kv = [&](const strata::core::SavedConversation& img) {
             if (!o.exp_tiered_kv || img.live.ids.empty() || (!radix_cache && !nvme_cache)) return;
-            const bool is_pinned = img.pinned();
+            // pin scope: only the blocks covering the first N tokens are pinned (N = the pinned checkpoint's
+            // length, the pin cut; a block straddling the cut counts, so short pins still keep their block),
+            // the tail past it stays evictable.  img.pinned() is "any checkpoint pinned", never use it here:
+            // it once pinned the whole conversation and eviction could never free a byte of it.
+            size_t pin_len = 0;
+            for (const auto& c : img.checkpoints) {
+                if (c.pinned) pin_len = std::max(pin_len, c.ids.size());
+            }
             const size_t total_tokens = img.live.ids.size();
             uint64_t prev_hash = 0;
 
@@ -8464,18 +8480,29 @@ int main(int argc, char** argv) {
 
                 block.header.block_hash = strata::core::kv_block_hash(block);
                 prev_hash = block.header.block_hash;
+                block.payload.shrink_to_fit();
 
+                // a block is pinned when it starts inside the pin: the block holding the cut counts, so
+                // pins shorter than one block still keep their block (over-pin at most one block of tail)
+                const bool in_pin = offset < pin_len;
                 auto block_ptr = std::make_shared<strata::core::KvBlock>(std::move(block));
                 if (radix_cache) {
                     auto node = radix_cache->insert_sequence(
-                        img.live.ids.data(), offset + count,
-                        is_pinned, is_pinned);
-                    if (node && o.conversation_cache_mib > 0) {
+                        img.live.ids.data(), offset + count, false, false);
+                    if (node) {
+                        // pins are set, never cleared: a shared prefix node may carry another parked
+                        // conversation's pin, and insert_sequence latches true (never stores false), so
+                        // clearing here could not stick anyway.  A stale pin only holds the old prefix
+                        // blocks, never the conversation tail.
+                        if (in_pin) {
+                            radix_cache->pin_node(node->node_id, true);
+                            radix_cache->mark_system_prompt(node->node_id, true);
+                        }
                         radix_cache->set_kv_block(node->node_id, block_ptr);
                     }
                 }
                 if (nvme_cache) {
-                    nvme_cache->write_block_async(*block_ptr, is_pinned);
+                    nvme_cache->write_block_async(*block_ptr, in_pin);
                 }
             }
         };
@@ -9654,6 +9681,8 @@ int main(int argc, char** argv) {
                 std::optional<strata::core::HostMemoryReading> mem;
                 auto admit = [&] {
                     mem = strata::core::sample_host_memory();
+                    // the radix tree's own budget (--tiered-kv-ram-mib) is its guard; it is anonymous memory,
+                    // already outside MemAvailable, so it is not charged to this reading again
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
@@ -9695,10 +9724,13 @@ int main(int argc, char** argv) {
                 persist_tiered_kv(image);
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.enabled() ? conversations.put(std::move(image), held) : false;
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                const auto rs = radix_cache ? radix_cache->get_stats() : strata::core::RadixConvCacheStats{};
+                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu radix_bytes=%zu radix_nodes=%zu radix_evictions=%zu radix_pinned=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes,
+                             static_cast<size_t>(rs.total_ram_bytes), static_cast<size_t>(rs.total_nodes),
+                             static_cast<size_t>(rs.evictions), static_cast<size_t>(rs.pinned_nodes));
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.

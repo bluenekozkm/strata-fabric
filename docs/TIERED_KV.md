@@ -81,6 +81,12 @@ The Persistent Tiered KV Cache addresses this:
   updating CAS hashes throughout the subtree.
 - **0 VRAM penalty**: Branches are held in host RAM; GPU VRAM only maps the currently active execution context.
 - **RAM budget enforcement**: Prunes least-recently-used unpinned leaf nodes when host memory budget is reached.
+  The budget is the radix tree's own (`--tiered-kv-ram-mib`, default 2048 MiB), not shared with the parked
+  conversation cache.
+- **Pin scope**: A `pin=N` request key pins only the radix blocks covering the first N tokens of the
+  conversation (128-token blocks; a block straddling the cut counts). The tail past the pin stays evictable.
+  Pins are set, never cleared: a shared prefix node may carry another parked conversation's pin, so one
+  conversation's park cannot take it away. A stale pin only holds the old prefix blocks, never the tail.
 
 ### 4. PCIe DMA Context Switcher & Stream Link (`include/strata/core/context_switcher.hpp`)
 
@@ -101,6 +107,10 @@ The Persistent Tiered KV Cache addresses this:
   - `--exp-tiered-kv [DIR]`: Enables experimental persistent tiered KV cache. If `DIR` is specified, blocks are persisted to SSD via Direct I/O; if omitted, runs in RAM-only mode (Tier 1 Radix tree in host RAM) and logs a warning that cached sessions are volatile and will be lost on engine restart. Tier 1 (RAM-only) is recommended for most workloads to prevent SSD wear.
   - `--kv-disk-cache DIR`: Persistent disk KV cache directory (implies `--exp-tiered-kv`).
   - `--kv-disk-budget N`: Maximum disk budget in MiB (default: 10240, 10 GiB).
+  - `--tiered-kv-ram-mib N`: Host RAM budget for the radix tree in MiB (default: 2048, 2 GiB). Its own budget:
+    the parked conversation cache (`--conversation-cache-mib`) and the radix tree each get their own, so the
+    two together can hold up to the sum. Earlier builds sized the radix tree after `--conversation-cache-mib`
+    (4096 with `--exp-tiered-kv`); pass `--tiered-kv-ram-mib 4096` to keep that size.
   - `--kv-multi-system-prompt`: Enables multi-branch radix tree cache in resident `--serve` mode. Part of the experimental tiered KV cache suite (activates `--exp-tiered-kv`).
 - **Signal handling**: `SIGINT` and `SIGTERM` handlers flush dirty blocks and synchronize manifest index to disk.
 - **Server integration**: `serve/server.py` recognizes system prompt switches, hashes system prompt prefixes,
@@ -132,6 +142,16 @@ strata --pack <pack_dir> --native <model.gguf> --serve \
        --exp-tiered-kv /path/to/kv_cache \
        --kv-disk-budget 20480
 ```
+
+Every park logs the radix tree's state so RAM growth is visible in the engine log:
+
+```
+strata serve: conversation cache: parked N tokens in T ms; parked=... bytes=... evictions=... snapshot_bytes=...
+              reused_kv_bytes=... radix_bytes=... radix_nodes=... radix_evictions=... radix_pinned=...
+```
+
+`radix_bytes` stops at the `--tiered-kv-ram-mib` budget and `radix_evictions` starts climbing once it is full;
+`radix_pinned` is the number of pinned nodes (the pinned prefixes).
 
 ### 3. Configuring via `serve/server.py`
 

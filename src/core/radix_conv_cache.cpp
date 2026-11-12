@@ -163,9 +163,7 @@ std::shared_ptr<RadixKvNode> RadixConvCache::insert_sequence(
             new_node->is_pinned.store(is_pinned, std::memory_order_relaxed);
             new_node->last_accessed_us.store(now, std::memory_order_relaxed);
             if (config_.host_ram_budget_bytes > 0) {
-                if (config_.host_ram_budget_bytes > 0) {
-            new_node->kv_block = std::move(block);
-        }
+                new_node->kv_block = std::move(block);
             }
             new_node->ram_bytes = new_node->compute_ram_bytes();
 

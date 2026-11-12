@@ -431,6 +431,52 @@ void test_pinning_and_removal() {
 }
 
 // -----------------------------------------------------------------------------
+// Test 8b: Explicit pin scope (the persist_tiered_kv pattern) and shared-prefix pin survival
+// -----------------------------------------------------------------------------
+void test_explicit_pin_scope_and_convergence() {
+    std::printf("[Test 8b] Explicit pin scope and shared-prefix pin survival...\n");
+
+    RadixConvCacheConfig cfg;
+    cfg.host_ram_budget_bytes = 0; // unlimited during initial setup
+    cfg.auto_evict_on_insert = false;
+    RadixConvCache cache(cfg);
+
+    const std::vector<int32_t> pinned_seq = {10, 20, 30};
+    const std::vector<int32_t> tail_seq = {40, 50, 60};
+
+    // The persist_tiered_kv pattern: insert with no flags, then set the pin explicitly.
+    // Production pins set-only (never pin_node(false)): a shared prefix node may carry another
+    // parked conversation's pin, and a clear could not stick anyway - insert_sequence only
+    // latches true.
+    auto pinned = cache.insert_sequence(pinned_seq, /*is_system_prompt=*/false, /*is_pinned=*/false);
+    auto tail = cache.insert_sequence(tail_seq, /*is_system_prompt=*/false, /*is_pinned=*/false);
+    CHECK(cache.pin_node(pinned->node_id, true));
+    CHECK(cache.mark_system_prompt(pinned->node_id, true));
+    CHECK(cache.is_pinned(pinned->node_id));
+    CHECK(cache.is_system_prompt(pinned->node_id));
+
+    // Budget fits only root and the pinned node: the unpinned tail must go, the pin stays
+    const size_t protected_bytes = cache.root()->ram_bytes + pinned->ram_bytes;
+    cache.set_host_ram_budget_bytes(protected_bytes);
+    CHECK(cache.evict_to_budget(0) >= 1);
+    CHECK(cache.find_node(pinned->node_id) != nullptr);
+    CHECK(cache.find_node(tail->node_id) == nullptr);
+
+    // A second conversation parks on the same shared prefix WITHOUT a pin: its own tail is
+    // evictable, and it must NOT clear the first conversation's pin on the shared node
+    auto shared_tail = cache.insert_sequence({10, 20, 30, 99},
+                                             /*is_system_prompt=*/false, /*is_pinned=*/false);
+    CHECK(shared_tail != nullptr);
+    CHECK(!cache.is_pinned(shared_tail->node_id));
+    CHECK(cache.is_pinned(pinned->node_id)); // the shared node keeps its pin
+
+    cache.set_host_ram_budget_bytes(protected_bytes);
+    CHECK(cache.evict_to_budget(0) >= 1);
+    CHECK(cache.find_node(shared_tail->node_id) == nullptr); // the second tail goes
+    CHECK(cache.find_node(pinned->node_id) != nullptr);      // the shared pin survives
+}
+
+// -----------------------------------------------------------------------------
 // Test 9: Node splitting invalidates stale KV block on trimmed child
 // -----------------------------------------------------------------------------
 void test_node_split_with_kv_block_invalidation() {
@@ -555,6 +601,7 @@ int main() {
     test_branch_retrieval_and_cas_hashes();
     test_kv_block_attachment();
     test_pinning_and_removal();
+    test_explicit_pin_scope_and_convergence();
     test_node_split_with_kv_block_invalidation();
     test_system_prompts_with_common_prefix();
     test_branch_retrieval_concurrency_no_deadlock();
