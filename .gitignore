@@ -93,3 +93,4 @@ node_modules/
 /local-tools/
 /.omc/
 /bench/
+*.bak
