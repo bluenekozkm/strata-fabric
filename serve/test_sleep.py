@@ -1,5 +1,6 @@
 """Sleep mode: save the conversation, unload the engine (all VRAM and RAM back), wake with the context restored."""
 import json
+import os
 import time
 import unittest
 import urllib.error
@@ -7,7 +8,7 @@ import urllib.request
 from pathlib import Path
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, MockEngine, Service, SessionRefused, serve
+from serve.server import ByteTokenizer, MockEngine, Service, SessionRefused, serve, sleep_file_path
 from serve.test_lifecycle import ResidentEngine
 
 
@@ -150,12 +151,39 @@ class Sleep(unittest.TestCase):
                       ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
         self.assertEqual(svc.sleep(), "unsupported")
 
+    def test_the_idle_thread_refuses_to_arm_when_sleep_cannot_work(self):
+        self.svc.sleep_timeout_s = 5
+        self.engine.batch = 2                          # parallel slots: sleep is refused (#465)
+        self.assertFalse(self.svc.start_idle_sleep())
+        self.engine.batch = 0
+        self.assertTrue(self.svc.start_idle_sleep())   # armed against the resident engine
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "Hello.", max_context=4096), tok,
+                      ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.sleep_timeout_s = 5
+        self.assertFalse(svc.start_idle_sleep())       # the mock has no session files
+
+    def test_the_sleep_file_path_follows_slot_save_then_cwd(self):
+        base = {"cwd": "/engines/dir"}
+        self.assertEqual(sleep_file_path(base, None), "/engines/dir/sleep.strsess")
+        self.assertEqual(sleep_file_path(base, "/slots"), "/slots/sleep.strsess")
+        self.assertEqual(sleep_file_path({**base, "sleep_file": "deep/my.bin"}, None),
+                         "/engines/dir/deep/my.bin")
+        self.assertEqual(sleep_file_path({**base, "sleep_file": "/abs/x.bin"}, "/slots"), "/abs/x.bin")
+        self.assertEqual(sleep_file_path({"sleep_file": "rel.bin"}, None),
+                         os.path.abspath("rel.bin"))
+        self.assertEqual(sleep_file_path({"sleep_file": ""}, None),          # empty = the default
+                         os.path.abspath(os.path.join(os.getcwd(), "sleep.strsess")))
+        for bad in ({"sleep_file": 5}, {"sleep_file": "bad\npath"}):
+            with self.assertRaises(ValueError):
+                sleep_file_path(bad, None)
+
     def test_sleep_needs_the_api_key_like_the_other_control_endpoints(self):
         self.engine.loaded = True
         self.svc.api_key = "local-secret"
         self.assertEqual(self.request("/sleep", {})[0], 401)
         self.assertEqual(self.request("/sleep", {}, {"Origin": "https://other.example",
-                                                       "Authorization": "Bearer local-secret"})[0], 403)
+                                                     "Authorization": "Bearer local-secret"})[0], 403)
         self.assertEqual(self.request("/sleep", {}, {"Authorization": "Bearer local-secret"})[0], 200)
         self.assertTrue(self.engine.unloaded)
 

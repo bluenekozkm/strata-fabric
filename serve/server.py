@@ -3750,6 +3750,20 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+def sleep_file_path(cfg: dict, slot_save_path: str | None) -> str:
+    """Where sleep mode keeps the conversation: the config's "sleep_file", relative to the config's "cwd" (the
+    engine's folder) like the config's slot_save_path; the default lands in the slot save directory when there is
+    one, else the directory the server was started in.  ValueError for anything that is not a plain path — the
+    engine gets the path on a protocol line, so no control characters."""
+    sf = cfg.get("sleep_file") or "sleep.strsess"
+    if not isinstance(sf, str) or not sf.strip():
+        raise ValueError('config "sleep_file" must be a file path')
+    path = os.path.abspath(os.path.join(slot_save_path or cfg.get("cwd") or os.getcwd(), sf)
+                           if not os.path.isabs(sf) else sf)
+    if any(ord(c) < 32 for c in path):
+        raise ValueError('config "sleep_file" must not contain control characters')
+    return path
+
 def extract_system_prompts(req: dict | None, messages: list[dict] | None = None) -> list[str]:
     """Extract list of system prompt contents from req and/or messages."""
     sys_list = []
@@ -4520,9 +4534,12 @@ class Service:
         finally:
             self.fifo.release()
 
-    def start_idle_sleep(self):
-        if not self.sleep_timeout_s or not hasattr(self.engine, "session_file"):
-            return
+    def start_idle_sleep(self) -> bool:
+        """Arm the idle-sleep thread.  False when this server cannot sleep (no timeout, an engine without
+        session files, or parallel slots) — the caller falls back to the plain idle unload."""
+        if not self.sleep_timeout_s or not hasattr(self.engine, "session_file") \
+                or getattr(self.engine, "batch", 0):
+            return False
         print(f"[strata] the model sleeps after {self.sleep_timeout_s:g} s without requests; the conversation is "
               f"kept at {self.sleep_file} and comes back with the next request", flush=True)
 
@@ -4531,12 +4548,13 @@ class Service:
                 time.sleep(max(1.0, min(30.0, self.sleep_timeout_s / 4)))
                 try:
                     r = self.sleep(idle_for=self.sleep_timeout_s)
-                except (EngineStuck, SessionRefused, EngineDied) as e:   # tried again at the next turn
+                except (EngineStuck, SessionRefused, EngineDied, ValueError) as e:   # tried again at the next turn
                     print(f"[strata] idle sleep: {e}", flush=True)
                     continue
                 if r == "unsupported":
                     return                      # nothing can sleep here; stop asking
         threading.Thread(target=loop, daemon=True).start()
+        return True
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -8661,14 +8679,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
-    # where sleep mode keeps the conversation: the config's "sleep_file", relative to the config's "cwd" (the
-    # engine's folder) like the config's slot_save_path; the default lands in the slot save directory when there
-    # is one, else the directory the server was started in
-    sf = cfg.get("sleep_file") or "sleep.strsess"
-    if not isinstance(sf, str) or not sf.strip():
-        raise SystemExit('[strata] config "sleep_file" must be a file path')
-    svc.sleep_file = os.path.abspath(os.path.join(svc.slot_save_path or cfg.get("cwd") or os.getcwd(), sf)
-                                     if not os.path.isabs(sf) else sf)
+    try:
+        svc.sleep_file = sleep_file_path(cfg, svc.slot_save_path)
+    except ValueError as e:
+        raise SystemExit(f"[strata] {e}")
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -8736,8 +8750,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
-    if svc.sleep_timeout_s:                         # sleep mode replaces the plain idle unload: it keeps the context
-        svc.start_idle_sleep()
+    if svc.sleep_timeout_s and svc.start_idle_sleep():   # sleep mode replaces the plain idle unload: it keeps the context
+        pass
     else:
         svc.start_idle_unload()
     svc.start_vision_idle()
