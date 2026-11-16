@@ -84,12 +84,16 @@ class KeepAwakeTests(unittest.TestCase):
         svc.keep_awake = ka = KeepAwake(rec)
         kinds = [k for k, _ in svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())]
         self.assertIn("done", kinds)
-        self.assertTrue(wait_for(lambda: rec.calls == [ON, ES_CONTINUOUS]))
+        # a request that begins and ends before the keep-awake thread's first wake has nothing to hold: the worker calls
+        # only when the state has to change, so the record is empty then (never a hold left on). Either way it must not
+        # end on a bare ON - the next part keeps one request open and watches the hold itself.
+        wait_for(lambda: rec.calls != [ON])
+        self.assertIn(rec.calls, ([], [ON, ES_CONTINUOUS]))
         gen = svc.run(tok.encode("hi"), False, None, 8, {}, threading.Event())
-        next(gen)
-        self.assertTrue(wait_for(lambda: rec.calls[-1] == ON))
+        next(gen)                                             # the request is held open: the worker must set the hold
+        self.assertTrue(wait_for(lambda: rec.calls[-1:] == [ON]))          # a slice: nothing yet is not an IndexError
         gen.close()                                           # the client left
-        self.assertTrue(wait_for(lambda: rec.calls[-1] == ES_CONTINUOUS))
+        self.assertTrue(wait_for(lambda: rec.calls[-1:] == [ES_CONTINUOUS]))
         ka.close()
 
     def test_default_service_has_none(self):
