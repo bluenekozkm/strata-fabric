@@ -42,4 +42,4 @@ Upstream (Niko1221/Strata) is a read-only source of engine updates: `git fetch u
 upstream/main`; the push URL is set to `DISABLED`. Never push there, and never squash or rebase across a
 merge base. After a merge, the removed paths (apps, Terminal, packaging, sycl, metal, setup, docker, the
 web UI, the Terminal/app docs, most of tools/, most of strata_control/) come back as modify/delete
-conflicts: resolve each with
+conflicts: resolve each with `git rm`, so the path stays deleted. The engine and server files merge as usual.

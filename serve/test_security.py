@@ -6,18 +6,20 @@ against the mock engine (no GPU, no pack).
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.client
 import io
 import json
 import socket
 import sys
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (ByteTokenizer, MockEngine, Service, allowed_hosts_of, host_allowed,  # noqa: E402
+from serve.server import (ByteTokenizer, MockEngine, Server, Service, allowed_hosts_of, host_allowed,  # noqa: E402
                           host_name, host_names_for, origin_allowed, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,6 +57,62 @@ class HostNames(unittest.TestCase):
             names = host_names_for("127.0.0.1", ["strata.example.com", "*"], ["https://chat.example.net"])
             self.assertTrue({"strata.example.com", "chat.example.net"} <= names)
             self.assertNotIn("*", names)
+
+
+class ListenAddress(unittest.TestCase):
+    def test_bind_does_not_look_up_a_host_name(self):
+        """http.server's own server_bind asks socket.getfqdn for the address: on a Mac whose reverse lookup stalls (GitHub's macOS runner:
+        35 s for the first lookup of every new process) a start listened that much later. No network answer may delay a start."""
+        with mock.patch.object(socket, "getfqdn", side_effect=AssertionError("server_bind looked up a host name")), \
+                mock.patch.object(socket, "gethostbyaddr", side_effect=AssertionError("server_bind looked up a host name")):
+            with Server(("127.0.0.1", 0), BaseHTTPRequestHandler) as s:
+                self.assertNotEqual(s.server_address[1], 0)
+
+    def test_bind_sets_server_name_to_the_address_and_server_port(self):
+        # (http.server set server_name to the looked-up name, "localhost" for 127.0.0.1; no Strata code reads it)
+        with Server(("127.0.0.1", 0), BaseHTTPRequestHandler) as s:
+            self.assertEqual((s.server_name, s.server_port), ("127.0.0.1", s.server_address[1]))
+            self.assertGreater(s.server_port, 0)
+
+    def test_ipv4_address_family(self):
+        with Server(("127.0.0.1", 0), BaseHTTPRequestHandler, bind_and_activate=False) as s:
+            self.assertEqual(s.address_family, socket.AF_INET)
+
+    @unittest.skipUnless(socket.has_ipv6, "IPv6 is not available")
+    def test_ipv6_loopback(self):
+        for host in ("::1", "2001:db8::7"):
+            try:
+                with Server((host, 0), BaseHTTPRequestHandler, bind_and_activate=False) as s:
+                    self.assertEqual(s.address_family, socket.AF_INET6)
+            except OSError as e:
+                self.skipTest(f"IPv6 socket is not available: {e}")
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nok", max_context=4096), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        try:
+            httpd = serve(svc, host="::", port=0)
+        except OSError as e:
+            self.skipTest(f"IPv6 loopback is not available: {e}")
+        try:
+            self.assertEqual(httpd.address_family, socket.AF_INET6)
+            c = http.client.HTTPConnection("::1", httpd.server_address[1], timeout=10)
+            try:
+                try:
+                    c.connect()
+                except OSError as e:
+                    # a box whose loopback has no ::1 (IPv6 off for lo: Boston) can listen on :: but not reach ::1
+                    if e.errno in (errno.EADDRNOTAVAIL, errno.ENETUNREACH, errno.EAFNOSUPPORT):
+                        self.skipTest(f"no IPv6 loopback address (::1) on this computer: {e}")
+                    raise
+                c.request("GET", "/health")
+                r = c.getresponse()
+                self.assertEqual(r.status, 200)
+                r.read()
+            finally:
+                c.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
 
 class HostCheck(unittest.TestCase):

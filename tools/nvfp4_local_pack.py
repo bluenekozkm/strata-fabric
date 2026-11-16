@@ -63,7 +63,19 @@ PLE_ROW_BYTES = 90          # 80 B of E2M1 codes + 10 E4M3 block scales, per 160
 
 # --------------------------------------------------------------------------------------------- safetensors access
 class Checkpoint:
-    """Header-indexed, memory-mapped access to a checkpoint's safetensors shards (raw bytes, any dtype)."""
+    """Header-indexed, buffered access to a checkpoint's safetensors shards (raw bytes, any dtype).
+
+    Reads go through a cached file handle into a fresh buffer instead of a process-lifetime np.memmap:
+    a memmap sweep of the ~64 GB of expert bytes charges every faulted page to the PROCESS WORKING
+    SET, which Windows (and every free-RAM observer reading GlobalMemoryStatusEx) counts as used
+    until the OS trims it - the pack step then looks like a ~64 GB RAM demand while its real
+    committed need is a few GB, and under memory pressure it is the pack run itself that pays
+    (issue: the silent exit-1 mid-pack failure).
+    A cached sequential read puts the same pages in the system file cache (standby: counted as
+    available).  The returned array is a fresh WRITABLE buffer - no consumer writes (a mutator would
+    previously have hit the read-only memmap) - and reads share one handle per shard, so raw() is
+    not thread-safe, unlike the memmap it replaces.  Each shard is read as three ascending streams
+    (exceptions, weights, CSF-fixed) walked expert-ascending."""
 
     def __init__(self, folder, partial_ok=False):
         self.dir = pathlib.Path(folder)
@@ -76,7 +88,7 @@ class Checkpoint:
         if not files:
             raise FileNotFoundError("no .safetensors files in " + str(self.dir))
         self.meta: dict[str, tuple[str, str, list[int], int, int]] = {}
-        self._mm: dict[str, np.memmap] = {}
+        self._fh: dict[str, "object"] = {}
         for fn in files:
             path = self.dir / fn
             if not path.exists() and partial_ok:
@@ -100,9 +112,14 @@ class Checkpoint:
 
     def raw(self, name) -> np.ndarray:
         fn, _, _, a, b = self.meta[name]
-        if fn not in self._mm:
-            self._mm[fn] = np.memmap(self.dir / fn, dtype=np.uint8, mode="r")
-        return self._mm[fn][a:b]
+        f = self._fh.get(fn)
+        if f is None:
+            f = self._fh[fn] = open(self.dir / fn, "rb")
+        buf = np.empty(b - a, dtype=np.uint8)
+        f.seek(a)
+        if f.readinto(buf) != b - a:
+            raise EOFError("%s: shard %s ended early at %d" % (name, fn, a))
+        return buf
 
     def array(self, name, np_dtype) -> np.ndarray:
         return self.raw(name).view(np_dtype).reshape(self.shape(name))
@@ -435,10 +452,9 @@ def cmd_mtp(a) -> int:
 def cmd_slim(a) -> int:
     """Copy a converted GGUF without its routed experts (and their .scale / .input_scale tensors): the file the engine
     reads the dense weights from (--native / --native-dense-gguf), ~9 GB instead of ~74 GB, once experts.bin is cut."""
-    from _paths import add_gguf_py
-    add_gguf_py()
-    import gguf
-    from gguf import GGUFReader, GGUFWriter, GGUFValueType as VT
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    GGUFReader, GGUFWriter, VT = gguf.GGUFReader, gguf.GGUFWriter, gguf.GGUFValueType
     rd = GGUFReader(a.gguf)
     arch = rd.fields["general.architecture"].contents()
     w = GGUFWriter(a.out, arch)
@@ -499,9 +515,8 @@ class _VGguf:
 
 def experts_from_checkpoint(model, ck: Checkpoint, n_layers: int = 48, n_exp: int = 512):
     """Give an iq_pack.Model of the dense-only GGUF the routed experts of the checkpoint as virtual tensors."""
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q
+    from _paths import gguf_lib
+    Q = gguf_lib().GGMLQuantizationType
     src = next(iter(model.where.values()))[3]
     cache: dict = {}
     base = "model.language_model.layers.%d.mlp.experts.%d.%s_proj."
@@ -617,11 +632,13 @@ def cmd_prepare(a) -> int:
 
 # ------------------------------------------------------------------------------------------------------ verifying
 def cmd_verify(a) -> int:
-    """Experts: decode the checkpoint (CSF + ModelOpt definition) and compare with gguf-py's dequantization of the
+    """Experts: decode the checkpoint (CSF + ModelOpt definition) and compare with tools/strata_quants.py's dequantization of the
     GGUF's NVFP4 blocks times the scale tensor, bit for bit (zeros normalised: ggml has one zero)."""
     import torch
     import nvfp4_verify as V
-    from gguf import GGUFReader, GGMLQuantizationType as Q, quants
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    GGUFReader, Q, quants = gguf.GGUFReader, gguf.GGMLQuantizationType, gguf.quants
     ck = Checkpoint(a.model)
     rd = GGUFReader(a.gguf)
     T = {t.name: t for t in rd.tensors}

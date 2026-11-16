@@ -28,8 +28,9 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-LLAMA_PIN = "3cf03257f219afbe7334045ff7c6a06ac68c627d"        # the llama.cpp commit CMakeLists fetches
-LLAMA_DIR = ROOT / "third_party" / "llama.cpp"
+LLAMA_PIN = "3cf03257f219afbe7334045ff7c6a06ac68c627d"        # the llama.cpp commit the vendored third_party/strata-ggml, strata-gguf-py and strata-llama are frozen at
+GGML_DIR = ROOT / "third_party" / "strata-ggml"                # the ggml the engine builds (vendored: no checkout, no network)
+GGUF_PY_DIR = ROOT / "third_party" / "strata-gguf-py"          # the gguf-py the pack tools read (tools/_paths.py looks here first)
 EXE = "strata.exe" if os.name == "nt" else "strata"
 
 # ------------------------------------------------------------------------------------------------- the catalog
@@ -179,12 +180,12 @@ def data_folder(asked: str | None) -> Path:
 
 
 def gguf_py_env() -> dict:
-    if not LLAMA_DIR.is_dir():
-        say("  fetching the pinned llama.cpp (gguf-py for the pack tools, ggml for the build) ...")
-        LLAMA_DIR.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", "https://github.com/ggml-org/llama.cpp.git", str(LLAMA_DIR)])
-        run(["git", "-C", str(LLAMA_DIR), "checkout", LLAMA_PIN])
-    return dict(os.environ, STRATA_GGUF_PY=str(LLAMA_DIR / "gguf-py"))
+    # tools/_paths.py and tools/strata_gguf.py read the vendored third_party/strata-gguf-py by themselves; STRATA_GGUF_PY
+    # stays free for a person who wants another gguf-py (a llama.cpp checkout), and nothing is fetched here.
+    if not (GGUF_PY_DIR / "gguf").is_dir():
+        fail(f"{GGUF_PY_DIR} is missing", "use a full Strata checkout (git clone): the pack tools read the gguf-py vendored in "
+                                          "third_party/strata-gguf-py, and nothing is downloaded")
+    return dict(os.environ)
 
 
 # -------------------------------------------------------------------------------------------------- downloading
@@ -413,6 +414,9 @@ def build_engine(a) -> None:
     backend = a.build
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
+    if not (GGML_DIR / "ggml").is_dir():
+        fail(f"{GGML_DIR} is missing", "use a full Strata checkout (git clone): the engine builds the ggml vendored in "
+                                       "third_party/strata-ggml, and nothing is downloaded")
     archs = a.arch or detect_gfx(backend)
     if backend == "hip":
         root = hip_root(a.rocm)
@@ -424,26 +428,30 @@ def build_engine(a) -> None:
         os.environ["LD_LIBRARY_PATH"] = os.pathsep.join([*libs, os.environ.get("LD_LIBRARY_PATH", "")]).rstrip(os.pathsep)
         os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
         defs = ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
-                "-DSTRATA_PREFILL_MMQ=ON", "-DSTRATA_Q6K_EXPERTS=ON", "-DSTRATA_MMQ_KQUANTS=ON",
+                "-DSTRATA_PREFILL_MMQ=ON", "-DSTRATA_MMQ=ON", "-DSTRATA_Q6K_EXPERTS=ON", "-DSTRATA_MMQ_KQUANTS=ON",
                 f"-DCMAKE_HIP_ARCHITECTURES={archs}",
                 f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
                 f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                 "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *[str(Path(d).parent) for d in libs[1:]]]),
                 f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
-                f"-DSTRATA_GGML_DIR={llama_dir_for_build()}"]
+                "-DSTRATA_GGML_DIR="]
         bdir = ROOT / "build-hip"
     else:
         nvcc = shutil.which("nvcc")
         if not nvcc:
             fail("no nvcc on PATH", "install the CUDA toolkit, or point PATH at it")
-        defs = ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_Q6K_EXPERTS=ON",
+        defs = ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_MMQ=ON", "-DSTRATA_Q6K_EXPERTS=ON",
                 "-DSTRATA_MMQ_KQUANTS=ON", f"-DCMAKE_CUDA_ARCHITECTURES={archs}",
-                f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama_dir_for_build()}"]
+                f"-DCMAKE_CUDA_COMPILER={nvcc}", "-DSTRATA_GGML_DIR="]
         bdir = ROOT / "build"
     say(f"  configuring and compiling the {backend} engine for {archs} (10-20 minutes the first time) ...")
     run(["cmake", "-S", str(ROOT), "-B", str(bdir), "-G", "Ninja", *defs], env=dict(os.environ))
     run(["cmake", "--build", str(bdir), "--target", "strata"], env=dict(os.environ))
-    shutil.copy2(bdir / EXE, eng / EXE)
+    # write beside it, then rename: an engine that is serving right now keeps the file it runs, and the next start
+    # gets the new one (a plain copy of a running binary fails with "Text file busy" on Linux)
+    fresh = eng / (EXE + ".new")
+    shutil.copy2(bdir / EXE, fresh)
+    os.replace(fresh, eng / EXE)
     m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
     version = m.group(1) if m else "local"
     stamp = {"source": f"local-{backend}", "backend": backend, "version": version, "archs": archs.split(";")}
@@ -455,15 +463,6 @@ def build_engine(a) -> None:
     ok(f"engine built: {eng / EXE}")
     say("  (the image encoder is a separate build when you want it: cmake -S tools/vision -B build-vision && "
         "cmake --build build-vision --target strata-vision)")
-
-
-def llama_dir_for_build() -> Path:
-    if not LLAMA_DIR.is_dir():
-        say("  fetching the pinned llama.cpp (ggml comes from it) ...")
-        LLAMA_DIR.parent.mkdir(parents=True, exist_ok=True)
-        run(["git", "clone", "https://github.com/ggml-org/llama.cpp.git", str(LLAMA_DIR)])
-        run(["git", "-C", str(LLAMA_DIR), "checkout", LLAMA_PIN])
-    return LLAMA_DIR
 
 
 # -------------------------------------------------------------------------------------------------------- main

@@ -103,8 +103,10 @@ For NVIDIA, the same two commands with `-DSTRATA_ENABLE_CUDA=ON -DSTRATA_ENABLE_
 newer. Below that, only an experimental Pascal/Volta build exists: `-DSTRATA_EXPERIMENTAL_SM60=ON`, which needs a
 CUDA 12.x toolkit and is not tested here).
 
-CMake fetches the llama.cpp revision pinned by this repository. For an offline build, point `STRATA_GGML_DIR` at
-a checkout of that exact revision; using an arbitrary newer checkout changes the dependency being tested.
+The engine builds the ggml vendored in `third_party/strata-ggml`, so a build needs no network and no llama.cpp
+checkout. `-DSTRATA_GGML_DIR=<a llama.cpp checkout>` still builds from such a checkout instead (an override kept for
+two releases); the vendored copy is frozen at the `LLAMA_PIN` commit in `prepare.py`, and an arbitrary newer checkout
+changes the dependency being tested.
 
 ### 2. Get a model
 
@@ -168,16 +170,16 @@ sha256sum Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf          # compare with the pin
 echo "sha256 <pin>" > Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf.done
 ```
 
-**b. Build the pack** (the tokenizer the engine and the server read; needs the pinned llama.cpp for its
-`gguf-py`, the commit `LLAMA_PIN` names in `prepare.py`):
+**b. Build the pack** (the tokenizer the engine and the server read; its `gguf-py` is the one vendored in
+`third_party/strata-gguf-py`, frozen at the commit `LLAMA_PIN` names in `prepare.py` — nothing is downloaded):
 
 ```sh
-git clone https://github.com/ggml-org/llama.cpp.git third_party/llama.cpp
-git -C third_party/llama.cpp checkout <LLAMA_PIN>
-export STRATA_GGUF_PY=$PWD/third_party/llama.cpp/gguf-py
 python3 tools/strata_tokenizer.py --gguf ../Strata-data/models/gyro-Gyro-S/Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf \
   --out ../Strata-data/packs/gyro-gyro-s                  # writes packs/gyro-gyro-s/tokenizer/
 ```
+
+`STRATA_GGUF_PY=<folder>` still selects another `gguf` package (a llama.cpp checkout's `gguf-py`), for a person who
+wants that copy for a comparison.
 
 Optional, for PCs whose RAM does not hold every expert: pack the experts into one file for the low-RAM mode
 (`--low-ram` in the easy way does this):

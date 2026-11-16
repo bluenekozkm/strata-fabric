@@ -4,12 +4,13 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/numa_pool.hpp"
+#include "strata/kernels/cpu/cgroup_cpu.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
+#include "strata/platform/cpu_relax.hpp"
 #if defined(_MSC_VER)
 #include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
 #endif
@@ -214,26 +215,15 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
 
 double container_cpu_quota() {
 #if defined(__linux__)
-    // cgroup v2: "max 100000" (no limit) or "<quota> <period>"; v1: cpu.cfs_quota_us (-1: none) / cpu.cfs_period_us
-    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
-        char a[32] = {0};
-        long period = 0;
-        double q = 0;
-        if (std::fscanf(f, "%31s %ld", a, &period) == 2 && std::strcmp(a, "max") != 0 && period > 0)
-            q = std::atof(a) / (double) period;
-        std::fclose(f);
-        return q > 0 ? q : 0.0;
-    }
-    long quota = -1, period = 0;
-    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r")) {
-        if (std::fscanf(f, "%ld", &quota) != 1) quota = -1;
+    // the smallest cgroup CPU quota from this process's group up to the mount's root (cgroup v2 cpu.max, v1 cfs quota); see cgroup_cpu.hpp
+    std::string self;
+    if (std::FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+        char buf[512];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) self.append(buf, n);
         std::fclose(f);
     }
-    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r")) {
-        if (std::fscanf(f, "%ld", &period) != 1) period = 0;
-        std::fclose(f);
-    }
-    return quota > 0 && period > 0 ? (double) quota / (double) period : 0.0;
+    return cgroup_cpu_quota_at("/sys/fs/cgroup", self);
 #else
     return 0.0;
 #endif
@@ -1010,7 +1000,7 @@ void ExpertPool::worker(int id) {
             } else
 #endif
             {
-                _mm_pause();
+                strata_cpu_pause();
                 if ((++spins & 1023u) != 0) continue;
             }
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
@@ -1131,7 +1121,7 @@ void ExpertPool::wait_parked(const char* what) {
     uint32_t spins = 0;
     std::chrono::steady_clock::time_point t0{};
     while (parked_count() != (uint32_t) n_) {
-        _mm_pause();
+        strata_cpu_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
@@ -1158,7 +1148,7 @@ void ExpertPool::wait_done(int n) {
         else
             d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        _mm_pause();
+        strata_cpu_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
@@ -1231,7 +1221,10 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    if (narithmetic_ == NativeArithmetic::WindowInvariant)
+                        native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    else
+                        native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                 } else if (q2_native_kernels(nfmt->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
@@ -1241,7 +1234,10 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 } else {
                     const void* hq[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    if (narithmetic_ == NativeArithmetic::WindowInvariant)
+                        native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    else
+                        native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
                 g += l1 - l0;
             }
@@ -1356,7 +1352,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
+void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
     if (n <= 0) return;
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
@@ -1364,6 +1360,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
+        narithmetic_ = arithmetic;
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
@@ -1408,7 +1405,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //
-    // The loop below used to be `while (done_ != n) _mm_pause();`.  The host is pinned to core 0 - the core
+    // The loop below used to be `while (done_ != n) strata_cpu_pause();`.  The host is pinned to core 0 - the core
     // `physical_cores(true)` deliberately keeps the five workers off - so for the whole drain that core was
     // idle while five cores did six cores' worth of work.  Measured before the change: 33.7 GB/s against
     // 5/6 x 44.14 = 36.8 for five workers and 44.14 for six.
