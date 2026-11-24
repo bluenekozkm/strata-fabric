@@ -15514,39 +15514,54 @@ int main(int argc, char** argv) {
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
         // ---- window warm-up (lane DRAFT-COSTS): the first run of a window width builds its graph / pipeline (srv118 CUDA: a capture; Metal: the first execution), so a
         // width that the policy first picks inside a long request pays it there (M5 Max, IQ3_S: +60 ms on the first five-row lookup round, in the timed code request in 5 of 8 launches
-        // with a table, because the release and the live costs happen to pay it in request 1).  One dummy window per allowed width 1..S, once, before the first request is read; it
-        // changes nothing a request can see: the windows write K/V cells 0..T-1 and the recurrent state of the session, and session_zero() below zeroes the session exactly as a request
-        // that reuses nothing does (the engine's state after session_init); no checkpoint, conversation entry, RNG draw, policy sample or statistic is touched (the policy's observe_*
+        // with a table, because the release and the live costs happen to pay it in request 1).  One dummy window per allowed width 1..S, once.  It changes nothing a request
+        // can see: the windows write K/V cells 0..T-1 and the recurrent state of the session, and session_zero() below zeroes the session exactly as a request that reuses
+        // nothing does (the engine's state after session_init); no checkpoint, conversation entry, RNG draw, policy sample or statistic is touched (the policy's observe_*
         // calls live in the decode loop); the expert cache may page in what the dummy token routes to (speed only).  STRATA_WINDOW_WARM=0: off (research switch).
+        // The captures stay here, before READY.  The runs go to a thread after it: READY is one window-run earlier, and
+        // the first request then waits on the join in the loop below instead of inside the READY wait - the wake's
+        // RESTORE line is already queued when the runs finish.  No request can meet a half-warmed engine.
+        // STRATA_WARM_AT_READY=0 keeps the runs here too, the order every earlier version had.
+        std::thread warm_thr;
+        std::string warm_werr;                        // the runs' error; written by whichever thread runs them, read after a join
         {
             static const bool warm_off = [] { const char* v = std::getenv("STRATA_WINDOW_WARM"); return v != nullptr && v[0] == '0'; }();
+            static const bool warm_at_ready = [] { const char* v = std::getenv("STRATA_WARM_AT_READY"); return !(v != nullptr && v[0] == '0'); }();
             if (!warm_off && o.spec >= 2 && n_stages == 1 && o.batch <= 0) {
-                const Clock::time_point w0 = Clock::now();
-                std::vector<int32_t> wtok((size_t) o.spec, 1), wout((size_t) o.spec + 1, 0);
-                std::string werr, wlist;
                 bool wok = true;
                 for (int t = 1; t <= o.spec && wok; ++t) {
                     if (!((lookup_size_mask(o) >> t) & 1u)) continue;
                     bool no_vram = false;
-                    if (!ver.prepare(t, no_vram, werr)) { if (no_vram) continue; wok = false; break; }   // CUDA / HIP: the graph now (a size that finds no VRAM is left to the runtime rule); Metal: nothing to do
-                    const Clock::time_point t0 = Clock::now();
+                    if (!ver.prepare(t, no_vram, warm_werr)) { if (no_vram) continue; wok = false; break; }   // CUDA / HIP: the graph now (a size that finds no VRAM is left to the runtime rule); Metal: nothing to do
+                }
+                auto run_widths = [&] {
+                    const Clock::time_point w0 = Clock::now();
+                    std::vector<int32_t> wtok((size_t) o.spec, 1), wout((size_t) o.spec + 1, 0);
+                    std::string wlist;
+                    bool wok2 = true;
+                    for (int t = 1; t <= o.spec && wok2; ++t) {
+                        if (!((lookup_size_mask(o) >> t) & 1u)) continue;
+                        const Clock::time_point t0 = Clock::now();
+                        drive.d.layers = 0;
+                        drive.d.experts = 0;
+                        drive.d.failed = false;
+                        wok2 = ver.run(t, wtok.data(), 0, win_pool_fn, win_pool_user, wout.data(), warm_werr) && !drive.d.failed;
+                        char wb[48];
+                        std::snprintf(wb, sizeof wb, "%s%d:%.0f", wlist.empty() ? "" : " ", t,
+                                      std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                        wlist += wb;
+                    }
+                    strata::core::session_zero(ss, g, nullptr, main_cs);
+                    cudaStreamSynchronize(main_stream);
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
-                    wok = ver.run(t, wtok.data(), 0, win_pool_fn, win_pool_user, wout.data(), werr) && !drive.d.failed;
-                    char wb[48];
-                    std::snprintf(wb, sizeof wb, "%s%d:%.0f", wlist.empty() ? "" : " ", t,
-                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-                    wlist += wb;
-                }
-                strata::core::session_zero(ss, g, nullptr, main_cs);
-                cudaStreamSynchronize(main_stream);
-                drive.d.layers = 0;
-                drive.d.experts = 0;
-                drive.d.failed = false;
-                std::fprintf(stderr, "strata serve: window warm-up: ms per width %s, total %.0f ms%s%s\n", wlist.c_str(),
-                             std::chrono::duration<double, std::milli>(Clock::now() - w0).count(), wok ? "" : "; a window failed: ",
-                             wok ? "" : werr.c_str());
+                    std::fprintf(stderr, "strata serve: window warm-up: ms per width %s, total %.0f ms%s%s\n", wlist.c_str(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - w0).count(), wok2 ? "" : "; a window failed: ",
+                                 wok2 ? "" : warm_werr.c_str());
+                };
+                if (warm_at_ready) warm_thr = std::thread(run_widths);
+                else run_widths();
             }
         }
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
@@ -16976,6 +16991,10 @@ int main(int argc, char** argv) {
             return pmtp_settle();
         };
         for (;;) {
+            if (warm_thr.joinable()) {          // the widths' first runs moved to this thread from before READY:
+                warm_thr.join();                // a line that arrived meanwhile waits here until they are done -
+                warm_thr = {};                  // nothing may touch the session, the drive or the verifier first
+            }
             line_drain_ms = 0.0;
             strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
             // Between requests (nothing in flight): the park pools' upkeep, which the park and the prompt read leave alone
