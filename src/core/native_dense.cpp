@@ -162,6 +162,208 @@ std::vector<uint8_t> q8_0_of_bf16(const uint16_t* x, uint64_t n) {
     for (auto& th : pool) th.join();
     return out;
 }
+
+// ---- the host-quantized rows' disk cache (STRATA_HC_Q8_CACHE, default on) ----
+// Every skipped row is re-read from the pack and re-quantized on the host at every start - measured at about
+// 0.5 s of the cold load for a 0.63 GiB Q8 set (RX 9070 XT, the gyro-m pack, 2026-11-24).  This keeps those
+// bytes in <pack>/hc-q8.cache, bound to the pack (index.txt sampled by size and first and last MiB, the way a
+// session file binds its model files) and to the engine version, so the next start reads them instead of
+// making them.  A cache that cannot be read, written or validated is a missed entry, never an error: a slower
+// start must not become a failed one.  STRATA_HC_Q8_CACHE=0 turns it off.
+constexpr uint32_t kHcQ8CacheFormat = 1;              // the file layout below
+constexpr uint32_t kHcQ8CacheCode = 1;                // bump when the rounding changes (q8_0_of_bf16, half_bits)
+
+bool hc_q8_cache_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_Q8_CACHE"); return !(v != nullptr && v[0] == '0'); }();
+    return on;
+}
+
+uint64_t fnv1a(const void* p, size_t n, uint64_t h = 14695981039346656037ull) {
+    const uint8_t* b = (const uint8_t*) p;
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+uint64_t fnv1a(uint64_t v, uint64_t h) {
+    uint8_t b[8];
+    for (int i = 0; i < 8; ++i) b[i] = (uint8_t) (v >> (8 * i));
+    return fnv1a(b, 8, h);
+}
+void le32(uint8_t* o, uint32_t v) { for (int i = 0; i < 4; ++i) o[i] = (uint8_t) (v >> (8 * i)); }
+void le64(uint8_t* o, uint64_t v) { for (int i = 0; i < 8; ++i) o[i] = (uint8_t) (v >> (8 * i)); }
+uint32_t from_le32(const uint8_t* o) { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = (v << 8) | o[i]; return v; }
+uint64_t from_le64(const uint8_t* o) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = (v << 8) | o[i]; return v; }
+
+// index.txt's size and its first and last MiB: a repack or an edit changes at least one of the three.  The path
+// stays out of it, as a session file's model binding does: the same pack under another folder is the same pack.
+bool pack_identity(const std::string& pack_dir, uint64_t& out) {
+    const std::string path = pack_dir + "/index.txt";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    uint64_t h = 14695981039346656037ull;
+    bool ok = true;
+    long long size = -1;
+#if defined(_WIN32)
+    ok = _fseeki64(f, 0, SEEK_END) == 0;
+    if (ok) size = _ftelli64(f);
+#else
+    ok = fseeko(f, 0, SEEK_END) == 0;
+    if (ok) size = (long long) ftello(f);
+#endif
+    char buf[1 << 20];
+    if (ok && size >= 0) {
+        h = fnv1a((uint64_t) size, h);
+        const size_t head = (size_t) (size < (long long) sizeof buf ? size : (long long) sizeof buf);
+#if defined(_WIN32)
+        ok = _fseeki64(f, 0, SEEK_SET) == 0;
+#else
+        ok = fseeko(f, 0, SEEK_SET) == 0;
+#endif
+        if (ok) ok = std::fread(buf, 1, head, f) == head;
+        if (ok) h = fnv1a(buf, head, h);
+        if (ok && size > (long long) sizeof buf) {
+#if defined(_WIN32)
+            ok = _fseeki64(f, -(long long) sizeof buf, SEEK_END) == 0;
+#else
+            ok = fseeko(f, -(off_t) sizeof buf, SEEK_END) == 0;
+#endif
+            if (ok) ok = std::fread(buf, 1, sizeof buf, f) == sizeof buf;
+            if (ok) h = fnv1a(buf, sizeof buf, h);
+        }
+    } else {
+        ok = false;
+    }
+    std::fclose(f);
+    if (!ok) return false;
+    out = h;
+    return true;
+}
+
+struct HcQ8CacheEntry {
+    std::string name;
+    uint64_t ne0 = 0, ne1 = 0, bytes = 0, offset = 0;
+};
+struct HcQ8Cache {
+    std::FILE* f = nullptr;
+    std::map<std::string, HcQ8CacheEntry> entries;
+};
+
+// "STRQ", the format, the code version, the pack identity, the engine version's length and bytes, then the
+// entry count and count x {u16 name bytes, name, u64 ne0, u64 ne1}; the Q8_0 payloads follow in the same order.
+bool hc_q8_cache_open(const std::string& pack_dir, uint64_t identity, HcQ8Cache& cache) {
+    const std::string path = pack_dir + "/hc-q8.cache";
+    cache = HcQ8Cache{};
+    cache.f = std::fopen(path.c_str(), "rb");
+    if (!cache.f) return false;
+    auto fail = [&] { std::fclose(cache.f); cache.f = nullptr; return false; };
+    uint8_t head[4 + 4 + 4 + 8 + 2];
+    if (std::fread(head, 1, sizeof head, cache.f) != sizeof head) return fail();
+    if (std::memcmp(head, "STRQ", 4) != 0 || from_le32(head + 4) != kHcQ8CacheFormat ||
+        from_le32(head + 8) != kHcQ8CacheCode || from_le64(head + 12) != identity)
+        return fail();
+    const uint16_t vlen = (uint16_t) (head[20] | (head[21] << 8));
+    const size_t vneed = (size_t) vlen;
+    if (vlen == 0 || vlen > 64) return fail();
+    std::vector<char> vstr(vneed);
+    if (std::fread(vstr.data(), 1, vneed, cache.f) != vneed) return fail();
+    if (std::memcmp(vstr.data(), STRATA_VERSION, vneed) != 0) return fail();
+    uint8_t cnt[4];
+    if (std::fread(cnt, 1, 4, cache.f) != 4) return fail();
+    const uint32_t count = from_le32(cnt);
+    if (count == 0 || count > 100000) return fail();
+    uint64_t offset = 4 + 4 + 4 + 8 + 2 + vneed + 4;
+    long long fsize = -1;
+#if defined(_WIN32)
+    if (_fseeki64(cache.f, 0, SEEK_END) == 0) fsize = _ftelli64(cache.f);
+#else
+    if (fseeko(cache.f, 0, SEEK_END) == 0) fsize = (long long) ftello(cache.f);
+#endif
+    if (fsize < 0) return fail();
+    for (uint32_t i = 0; i < count; ++i) {
+        uint8_t nh[2];
+        if (std::fread(nh, 1, 2, cache.f) != 2) return fail();
+        const uint16_t nlen = (uint16_t) (nh[0] | (nh[1] << 8));
+        if (nlen == 0 || nlen > 512) return fail();
+        HcQ8CacheEntry e;
+        e.name.resize(nlen);
+        uint8_t dims[16];
+        if (std::fread(e.name.data(), 1, nlen, cache.f) != nlen) return fail();
+        if (std::fread(dims, 1, sizeof dims, cache.f) != sizeof dims) return fail();
+        e.ne0 = from_le64(dims);
+        e.ne1 = from_le64(dims + 8);
+        if (e.ne0 == 0 || e.ne0 % 32 != 0 || e.ne1 == 0 || e.ne1 > (1ull << 32)) return fail();
+        e.bytes = e.ne0 / 32 * 34 * e.ne1;
+        e.offset = offset;
+        offset += e.bytes;
+        if (offset > (uint64_t) fsize) return fail();
+        if (!cache.entries.emplace(e.name, e).second) return fail();
+    }
+    return true;
+}
+
+bool hc_q8_cache_read(const HcQ8Cache& cache, const std::string& name, uint64_t ne0, uint64_t ne1,
+                      std::vector<uint8_t>& out) {
+    const auto it = cache.entries.find(name);
+    if (it == cache.entries.end() || it->second.ne0 != ne0 || it->second.ne1 != ne1) return false;
+    out.resize((size_t) it->second.bytes);
+#if defined(_WIN32)
+    if (_fseeki64(cache.f, (long long) it->second.offset, SEEK_SET) != 0) return false;
+#else
+    if (fseeko(cache.f, (off_t) it->second.offset, SEEK_SET) != 0) return false;
+#endif
+    return std::fread(out.data(), 1, out.size(), cache.f) == out.size();
+}
+
+struct HcQ8Made {
+    std::string name;
+    uint64_t ne0 = 0, ne1 = 0;
+    std::vector<uint8_t> q8;
+};
+bool hc_made_has(const std::vector<HcQ8Made>& made, const std::string& name) {
+    for (const HcQ8Made& m : made) if (m.name == name) return true;
+    return false;
+}
+
+// Best effort: a write that fails is one line in the log and a requantize at the next start.
+void hc_q8_cache_write(const std::string& pack_dir, uint64_t identity, const std::vector<HcQ8Made>& made) {
+    const std::string path = pack_dir + "/hc-q8.cache";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) {
+        std::fprintf(stderr, "STRATA_HC_Q8: the quantized projections were not cached (%s is not writable)\n", path.c_str());
+        return;
+    }
+    const uint16_t vlen = (uint16_t) std::strlen(STRATA_VERSION);
+    auto put = [&](const void* p, size_t n) { return std::fwrite(p, 1, n, f) == n; };
+    uint8_t head[4 + 4 + 4 + 8 + 2];
+    std::memcpy(head, "STRQ", 4);
+    le32(head + 4, kHcQ8CacheFormat);
+    le32(head + 8, kHcQ8CacheCode);
+    le64(head + 12, identity);
+    head[20] = (uint8_t) vlen;
+    head[21] = (uint8_t) (vlen >> 8);
+    bool ok = put(head, sizeof head) && put(STRATA_VERSION, vlen);
+    uint8_t cnt[4];
+    le32(cnt, (uint32_t) made.size());
+    ok = ok && put(cnt, 4);
+    for (const HcQ8Made& m : made) {
+        uint8_t nh[2];
+        nh[0] = (uint8_t) m.name.size();
+        nh[1] = (uint8_t) (m.name.size() >> 8);
+        uint8_t dims[16];
+        le64(dims, m.ne0);
+        le64(dims + 8, m.ne1);
+        ok = ok && put(nh, 2) && put(m.name.data(), m.name.size()) && put(dims, sizeof dims);
+    }
+    for (const HcQ8Made& m : made) ok = ok && put(m.q8.data(), m.q8.size());
+    const bool closed = std::fclose(f) == 0;
+    if (ok && closed) {
+        uint64_t bytes = 0;
+        for (const HcQ8Made& m : made) bytes += m.q8.size();
+        std::fprintf(stderr, "STRATA_HC_Q8: %.2f GiB of quantized projections cached to %s (the next start reads them)\n",
+                     (double) bytes / 1073741824.0, path.c_str());
+    } else {
+        std::remove(path.c_str());                      // a partial file is worse than none: validation would skip it anyway
+    }
+}
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -542,6 +744,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             // single-GPU default: add_hc_skip) from the pack file on the host, and has no bf16 copy at all. The
             // inject rows stay bf16 (82 KB), the final mixer stays bf16 (it runs once a window).
             uint64_t made = 0;
+            // the host-quantized rows' disk cache: opened once, read per row, written (merged with the served
+            // rows) when this start made at least one row itself - the first start for a pack, or after its
+            // cache was invalidated, or a configuration that quantizes rows the file does not hold yet
+            uint64_t hc_identity = 0;
+            const bool hc_cache_on = hc_q8_cache_env() && pack_identity(table.pack_dir_, hc_identity);
+            HcQ8Cache hc_cache;
+            int hc_from_cache = 0;
+            std::vector<HcQ8Made> hc_made;
+            if (hc_cache_on) hc_q8_cache_open(table.pack_dir_, hc_identity, hc_cache);
             for (auto& [name, ref] : table.table_) {
                 if (ref.hc_q8 != nullptr || name.rfind("blk.", 0) != 0 || !in_range(name) ||
                     !hc_q8_name(name) || !(name.ends_with("_down.weight") || name.ends_with("_up.weight"))) continue;
@@ -555,10 +766,18 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (cudaMalloc(&p, bytes) != cudaSuccess) { err = "native dense (STRATA_HC_Q8) alloc " + name; return false; }
                 weights_.push_back(p);
                 if (skipped) {
-                    std::vector<uint16_t> host;
-                    if (!table.read_bf16_host(name, host, err)) return false;
-                    const std::vector<uint8_t> q8 = q8_0_of_bf16(host.data(), (uint64_t) host.size());
-                    if (cudaMemcpy(p, q8.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    std::vector<uint8_t> q8;
+                    const uint8_t* q8_data = nullptr;
+                    if (hc_cache.f != nullptr && hc_q8_cache_read(hc_cache, name, ref.ne0, ref.ne1, q8)) {
+                        q8_data = q8.data();
+                        ++hc_from_cache;
+                    } else {
+                        std::vector<uint16_t> host;
+                        if (!table.read_bf16_host(name, host, err)) return false;
+                        hc_made.push_back(HcQ8Made{name, ref.ne0, ref.ne1, q8_0_of_bf16(host.data(), (uint64_t) host.size())});
+                        q8_data = hc_made.back().q8.data();
+                    }
+                    if (cudaMemcpy(p, q8_data, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = "native dense (STRATA_HC_Q8) upload " + name; return false;
                     }
                 } else {
@@ -572,6 +791,17 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             if (made && (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)) {
                 err = "native dense (STRATA_HC_Q8): quantizing the projections failed"; return false;
             }
+            if (hc_cache_on && !hc_made.empty()) {
+                if (hc_from_cache > 0)                           // the file gains the rows this run made: the served
+                    for (const auto& [cname, ce] : hc_cache.entries) {   // rows go back in, so the file keeps them all
+                        if (hc_made_has(hc_made, cname)) continue;
+                        std::vector<uint8_t> served;
+                        if (hc_q8_cache_read(hc_cache, cname, ce.ne0, ce.ne1, served))
+                            hc_made.push_back(HcQ8Made{cname, ce.ne0, ce.ne1, std::move(served)});
+                    }
+                hc_q8_cache_write(table.pack_dir_, hc_identity, hc_made);
+            }
+            if (hc_cache.f != nullptr) { std::fclose(hc_cache.f); hc_cache.f = nullptr; }
         }
         if (hc_q8_env()) {   // the scratches of hc_bf16_view (rows without a bf16 copy), here and not on first use
             uint64_t elems = 0;
