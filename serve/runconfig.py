@@ -42,7 +42,8 @@ EDITABLE = [
     ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
-     "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+     "VRAM in MiB the engine leaves free for other programs (engine default 700); a GPU image reader whose need fits "
+     "inside it starts with the first picture instead of before the model, so a wake does not pay its start"),
 ]
 SPEC = {k: kind for k, kind, _ in EDITABLE}
 

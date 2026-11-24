@@ -3278,6 +3278,7 @@ class Vision:
         self.gpu_spawn, self.cpu_spawn = self.spawn, self.fallback   # an on-demand reader tries the GPU one again at every start
         self.on_cpu = False                             # the CPU reader is what runs (the GPU one did not start, or there was no room)
         self.cpu_note = None                            # why, in words for the person (strata_control/reader_room.py), when the card had no room
+        self.needs_vram = bool(cfg.get("gpu"))          # the config asked for the card: only such a reader starts with the engine's load
         self.reader = None                              # "own" (Strata's) or "mtmd" (llama.cpp's) from the READY line; None for an older reader
         self.proc = None
         self.stopped = True
@@ -3297,6 +3298,12 @@ class Vision:
     # config without vision.max_tokens left the reader unclamped, and #3690 saw one picture become 93,700 image tokens (I7).  A key that is
     # there is the person's: 0 means no limit, as before.
     DEFAULT_MAX_TOKENS = {"gpu": 1024, "cpu": 300}
+
+    def holds_vram(self) -> bool:
+        """The reader as configured takes VRAM from the card (a GPU-configured one that has not fallen back to the
+        CPU).  Only such an encoder starts with the engine's load, before the engine sizes its cache; a CPU reader
+        waits for the first picture (_vision_up) so the load does not pay its start."""
+        return self.needs_vram and not self.on_cpu
 
     @staticmethod
     def elastic_ask_mib(cfg: dict, max_tokens: int) -> int:
@@ -5392,9 +5399,47 @@ class Service:
 
     def _vision_down(self) -> bool:
         """The encoder should run and does not (the engine's load starts it again).  An elastic encoder is down
-        between pictures by design: it starts in the image turn (_vision_up), not with the engine."""
-        return (self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
-                and not getattr(self.vision, "elastic", False))
+        between pictures by design: it starts in the image turn (_vision_up), not with the engine.  A reader the
+        cache's sizing does not depend on (a CPU one; a GPU one the engine's VRAM reserve covers) waits for the first
+        picture too: the engine's load does not pay its start."""
+        if not (self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()):
+            return False
+        if getattr(self.vision, "elastic", False):
+            return False
+        return self._vision_before_engine()
+
+    def _engine_vram_reserve_mib(self) -> int | None:
+        """The --vram-reserve-mib the running engine was started with (its spawn arguments; None: none seen).  The
+        reserve is the VRAM the expert cache sizes itself around, so a GPU image reader whose need fits inside it can
+        start later, in that reserve, instead of before the engine."""
+        spawn = getattr(self.engine, "spawn", None)
+        if not spawn or len(spawn) < 2 or not isinstance(spawn[1], list):
+            return None
+        best = None
+        args = spawn[1]
+        for i, a in enumerate(args):
+            if a == "--vram-reserve-mib" and i + 1 < len(args):
+                try:
+                    best = int(args[i + 1])             # a later flag wins, as user_args do over the generated args
+                except (TypeError, ValueError):
+                    pass
+            elif isinstance(a, str) and a.startswith("--vram-reserve-mib="):
+                try:
+                    best = int(a.split("=", 1)[1])
+                except ValueError:
+                    pass
+        return best
+
+    def _vision_before_engine(self) -> bool:
+        """Whether this encoder starts before the engine sizes its cache: only a GPU reader whose VRAM need the
+        engine's reserve does not cover.  A CPU reader holds no VRAM; a covered GPU reader fits in the reserve the
+        cache leaves free anyway.  A stub without the new attributes keeps the old eager start."""
+        v = self.vision
+        if not getattr(v, "holds_vram", lambda: True)():
+            return False                                # a CPU reader: nothing for the cache to size around
+        need = getattr(v, "elastic_mib", None)          # the reader's need at its token limit (reader_room)
+        return not (need is not None and self._engine_vram_reserve_mib() is not None
+                    and need <= self._engine_vram_reserve_mib())
 
     def _engine_reserve(self) -> int | None:
         """The VRAM the engine keeps free for other programs outside an elastic encoder's turn: the last POST /v1/vram
@@ -5403,14 +5448,20 @@ class Service:
         return self.vram_reserve if self.vram_reserve_asked else 0
 
     def _vision_up(self):
-        """The image turn's start for an elastic encoder that is not running (the caller holds self.fifo): the expert
-        cache first keeps the encoder's elastic_mib of VRAM free on top of the reserve, then the encoder starts (load and
-        warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident low-RAM mode)
-        the encoder starts anyway, as a non-elastic one would."""
+        """The image turn's start for an encoder that is not running (the caller holds self.fifo): an elastic one
+        first has the expert cache keep its elastic_mib of VRAM free on top of the reserve, then the encoder starts
+        (load and warm-up, a few seconds).  If the cache cannot shrink (an engine without --vram-elastic, the resident
+        low-RAM mode) the encoder starts anyway, as a non-elastic one would.  A reader the cache's sizing does not
+        depend on (a CPU one; a GPU one the engine's VRAM reserve covers) starts here, at the first picture: the
+        engine's load does not pay its start.  A GPU reader the reserve does not cover still starts with the engine's
+        load only: mid-request there is no VRAM dance left to make room for it."""
         v = self.vision
-        if not getattr(v, "elastic", False) or v.alive():
+        elastic = getattr(v, "elastic", False)
+        if not elastic and self._vision_before_engine():
+            return                    # an eager reader (and every stub without the new attributes) keeps the old path
+        if v.alive():
             return
-        if hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
+        if elastic and hasattr(self.engine, "vram") and self.loaded() and not self.vision_no_shrink:
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
@@ -5421,7 +5472,7 @@ class Service:
                 note = "" if self.vision_no_shrink and self.vision_no_shrink_said else f" ({e})"
                 self.vision_no_shrink_said = True
                 self._vision_room_check(v, note)
-        elif self.vision_no_shrink:
+        elif elastic and self.vision_no_shrink:
             self._vision_room_check(v, "")
         if self.vision_held:
             time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
