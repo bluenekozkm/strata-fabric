@@ -21409,11 +21409,21 @@ int main(int argc, char** argv) {
                 // #1620: stopped between two windows (or before the first token was read): the session is exactly at
                 // pp_reached, so it stays the live conversation - the next request continues from it or parks it.
                 // Without this a cancelled request that had restored a parked conversation dropped it.
-                live.assign(cur.begin(), cur.begin() + pp_reached);
-                live_imgs = imgs_below(req_imgs, pp_reached);
-                live_ok = true;
-                std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
-                             (long long) pp_reached);
+                if (from_live && resume == (int64_t) live.size() && pp_reached < (int64_t) cur.size()) {
+                    // stopped inside the turn's prompt, and the request had resumed from the live session: the cells
+                    // [0, resume) still hold exactly that session, so it stays live whole.  The prefix read past it is
+                    // this turn's half-read prompt - not a conversation to keep: the next save would overwrite the
+                    // complete session with the truncated prefix, and the wake would prefill from nothing.
+                    live_ok = true;
+                    std::fprintf(stderr, "strata serve: cancelled request keeps the conversation it resumed from: "
+                                 "%lld tokens live\n", (long long) resume);
+                } else {
+                    live.assign(cur.begin(), cur.begin() + pp_reached);
+                    live_imgs = imgs_below(req_imgs, pp_reached);
+                    live_ok = true;
+                    std::fprintf(stderr, "strata serve: cancelled request keeps its conversation: %lld tokens live\n",
+                                 (long long) pp_reached);
+                }
             }
             if (nib::config().recheck && nib::any_on() && !cancelled) {
                 // STRATA_EXPERT_NIBBLE_RECHECK=1 (debug): every converted slot's hash again on its own device, against the
